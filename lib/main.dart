@@ -1,0 +1,1215 @@
+import 'dart:io';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:on_audio_query/on_audio_query.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:just_audio_background/just_audio_background.dart';
+import 'package:audio_service/audio_service.dart';
+import 'package:metadata_god/metadata_god.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:http/http.dart' as http;
+import 'package:open_filex/open_filex.dart';
+
+import 'player/player_controller.dart';
+import 'player/audio_handler.dart';
+import 'playlist/playlist_store.dart';
+import 'playlist/playlist_page.dart';
+import 'player/play_mode.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await MetadataGod.initialize();
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.lifezq.walkman.channel.audio',
+    androidNotificationChannelName: '音频播放',
+    androidNotificationOngoing: true,
+  );
+  final audioHandler = await AudioService.init(
+    builder: () => MyAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.lifezq.walkman.channel.audio',
+      androidNotificationChannelName: '音频播放',
+      androidNotificationOngoing: true,
+    ),
+  );
+  runApp(WalkmanApp(audioHandler: audioHandler));
+}
+
+class WalkmanApp extends StatelessWidget {
+  final AudioHandler audioHandler;
+  const WalkmanApp({super.key, required this.audioHandler});
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiProvider(
+      providers: [
+        Provider<AudioHandler>.value(value: audioHandler),
+        ChangeNotifierProvider(create: (_) => PlayerController(audioHandler as MyAudioHandler)),
+        ChangeNotifierProvider(create: (_) => PlaylistStore()..load()),
+      ],
+      child: MaterialApp(
+        title: 'Walkman',
+        theme: ThemeData(useMaterial3: true),
+        builder: (context, child) => NowPlayingListener(child: child!),
+        home: const RootPage(),
+      ),
+    );
+  }
+}
+
+class RootPage extends StatelessWidget {
+  const RootPage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: TabBar(
+          tabs: [
+            Tab(text: '库', icon: Icon(Icons.library_music)),
+            Tab(text: '歌单', icon: Icon(Icons.queue_music)),
+          ],
+        ),
+        body: TabBarView(
+          children: [
+            HomePage(),
+            PlaylistPage(),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  final OnAudioQuery _audioQuery = OnAudioQuery();
+  List<SongModel> _songs = [];
+  List<_PickedAudio> _picked = [];
+  bool _loading = true;
+  final Set<String> _selected = {};
+  String _query = '';
+  bool _onlyLiked = false;
+  bool _onlyFavorite = false;
+  _SortMode _sortMode = _SortMode.titleAsc;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    if (Platform.isAndroid) {
+      await Permission.notification.request();
+      final audioStatus = await Permission.audio.request();
+      final storageStatus = await Permission.storage.request();
+      if (!audioStatus.isGranted && !storageStatus.isGranted) {
+        setState(() {
+          _loading = false;
+        });
+        return;
+      }
+    }
+    List<SongModel> songs = [];
+    if (Platform.isAndroid) {
+      songs = await _audioQuery.querySongs(
+        sortType: SongSortType.DATE_ADDED,
+        orderType: OrderType.DESC_OR_GREATER,
+        uriType: UriType.EXTERNAL,
+        ignoreCase: true,
+      );
+    } else {
+      await _loadImportedList();
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final likes = prefs.getStringList('likes')?.toSet() ?? <String>{};
+    final favorites = prefs.getStringList('favorites')?.toSet() ?? <String>{};
+    final controller = context.read<PlayerController>();
+    controller.loadStates(likes, favorites);
+    await controller.initPlayMode();
+    setState(() {
+      _songs = songs;
+      _loading = false;
+    });
+  }
+
+  Future<void> _pickFiles() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      type: FileType.custom,
+      allowedExtensions: ['mp3', 'aac', 'm4a', 'wav', 'flac', 'ogg'],
+    );
+    if (result == null) return;
+    final files = result.files.where((f) => f.path != null).toList();
+    final temp = await getTemporaryDirectory();
+    final list = <_PickedAudio>[];
+    for (final f in files) {
+      Uri? artUri;
+      String? artist;
+      Duration? duration;
+      try {
+        final meta = await MetadataGod.readMetadata(file: f.path!);
+        artist = meta.artist;
+        if (meta.durationMs != null) {
+          final ms = meta.durationMs!;
+          final int intMs = ms is int ? ms as int : (ms as num).round();
+          duration = Duration(milliseconds: intMs);
+        }
+        if (meta.picture != null && meta.picture!.data.isNotEmpty) {
+          final file = File('${temp.path}/art_${_safeName(f.path!)}.jpg');
+          await file.writeAsBytes(meta.picture!.data);
+          artUri = file.uri;
+        } else {
+          final url = await _searchArtworkUrl(f.name, artist);
+          if (url != null) {
+            final bytes = await _download(url);
+            if (bytes != null) {
+              final file = File('${temp.path}/art_${_safeName(f.path!)}.jpg');
+              await file.writeAsBytes(bytes);
+              artUri = file.uri;
+            }
+          }
+        }
+      } catch (_) {}
+      list.add(_PickedAudio(
+        uri: Uri.file(f.path!),
+        title: f.name,
+        artUri: artUri,
+        artist: artist,
+        duration: duration,
+      ));
+    }
+    setState(() {
+      _picked = list;
+    });
+    await _saveImportedList();
+  }
+
+  void _toggleSelectKey(String key) {
+    setState(() {
+      if (_selected.contains(key)) {
+        _selected.remove(key);
+      } else {
+        _selected.add(key);
+      }
+    });
+  }
+
+  void _clearSelection() {
+    setState(() {
+      _selected.clear();
+    });
+  }
+
+  void _selectAll() {
+    setState(() {
+      _selected.clear();
+      if (Platform.isIOS) {
+        _selected.addAll(_picked.map((e) => e.uri.toString()));
+      } else {
+        _selected.addAll(_songs.map((e) => e.id.toString()));
+      }
+    });
+  }
+
+  Future<void> _batchLike(PlayerController player, bool value) async {
+    if (Platform.isIOS) {
+      final keys = _selected;
+      if (value) {
+        await player.likeKeys(keys);
+      } else {
+        await player.unlikeKeys(keys);
+      }
+    } else {
+      final ids = _selected.map((k) => int.tryParse(k)).whereType<int>();
+      if (value) {
+        await player.likeIds(ids);
+      } else {
+        await player.unlikeIds(ids);
+      }
+    }
+    _clearSelection();
+  }
+
+  Future<void> _batchFavorite(PlayerController player, bool value) async {
+    if (Platform.isIOS) {
+      final keys = _selected;
+      if (value) {
+        await player.favoriteKeys(keys);
+      } else {
+        await player.unfavoriteKeys(keys);
+      }
+    } else {
+      final ids = _selected.map((k) => int.tryParse(k)).whereType<int>();
+      if (value) {
+        await player.favoriteIds(ids);
+      } else {
+        await player.unfavoriteIds(ids);
+      }
+    }
+    _clearSelection();
+  }
+
+  Future<void> _playSelection(PlayerController player) async {
+    if (_selected.isEmpty) return;
+    if (Platform.isIOS) {
+      final selectedSet = _selected.toSet();
+      final list = _picked.where((e) => selectedSet.contains(e.uri.toString())).toList();
+      final uris = list.map((e) => e.uri).toList();
+      final titles = list.map((e) => e.title).toList();
+      await player.setPlaylistFromUris(uris, titles: titles);
+    } else {
+      final ids = _selected.map((k) => int.tryParse(k)).whereType<int>().toSet();
+      final items = _songs.where((s) => ids.contains(s.id)).toList();
+      await player.setPlaylist(items);
+    }
+    await player.play();
+    _clearSelection();
+  }
+
+  Future<void> _addSingleSongToPlaylist(BuildContext context, SongModel s) async {
+    final store = context.read<PlaylistStore>();
+    final names = await _choosePlaylistNames(context, store);
+    if (names.isEmpty) return;
+    final entry = PlaylistItem(
+      uri: s.uri!,
+      title: s.title,
+      artist: s.artist,
+      durationMs: s.duration,
+    );
+    for (final n in names) {
+      await store.addOrCreate(n, [entry]);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('last_playlist_names', names);
+  }
+  Future<void> _saveImportedList() async {
+    final prefs = await SharedPreferences.getInstance();
+    final data = _picked
+        .map((e) => {
+              'uri': e.uri.toString(),
+              'title': e.title,
+              'artist': e.artist,
+              'durationMs': e.duration?.inMilliseconds,
+              'artPath': e.artUri != null && e.artUri!.scheme == 'file' ? e.artUri!.toFilePath() : null,
+            })
+        .toList();
+    await prefs.setString('imported_files', jsonEncode(data));
+  }
+
+  Future<void> _loadImportedList() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('imported_files');
+    if (raw == null) return;
+    try {
+      final list = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
+      _picked = list
+          .map((m) => _PickedAudio(
+                uri: Uri.parse(m['uri'] as String),
+                title: m['title'] as String,
+                artist: m['artist'] as String?,
+                duration: m['durationMs'] != null ? Duration(milliseconds: (m['durationMs'] as num).round()) : null,
+                artUri: (m['artPath'] != null) ? File(m['artPath'] as String).uri : null,
+              ))
+          .toList();
+    } catch (_) {}
+  }
+
+  Future<void> _deleteSelection() async {
+    if (!Platform.isIOS || _selected.isEmpty) return;
+    final keys = _selected.toSet();
+    final toDelete = _picked.where((e) => keys.contains(e.uri.toString())).toList();
+    for (final item in toDelete) {
+      if (item.artUri != null && item.artUri!.scheme == 'file') {
+        try {
+          final f = File.fromUri(item.artUri!);
+          if (await f.exists()) {
+            await f.delete();
+          }
+        } catch (_) {}
+      }
+    }
+    setState(() {
+      _picked.removeWhere((e) => keys.contains(e.uri.toString()));
+      _selected.clear();
+    });
+    await _saveImportedList();
+  }
+
+  Future<String?> _searchArtworkUrl(String title, String? artist) async {
+    try {
+      final term = Uri.encodeComponent([title, if (artist != null) artist].where((e) => e != null && e.isNotEmpty).join(' '));
+      final url = 'https://itunes.apple.com/search?media=music&limit=1&term=$term';
+      final res = await http.get(Uri.parse(url));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        final results = data['results'] as List<dynamic>;
+        if (results.isNotEmpty) {
+          final art = results.first['artworkUrl100'] as String?;
+          if (art != null) {
+            return art.replaceAll('100x100bb', '512x512bb');
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<List<int>?> _download(String url) async {
+    try {
+      final res = await http.get(Uri.parse(url));
+      if (res.statusCode == 200) return res.bodyBytes;
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _addSinglePickedToPlaylist(BuildContext context, _PickedAudio item) async {
+    final store = context.read<PlaylistStore>();
+    final names = await _choosePlaylistNames(context, store);
+    if (names.isEmpty) return;
+    final entries = [
+      PlaylistItem(
+        uri: item.uri.toString(),
+        title: item.title,
+        artist: item.artist,
+        artPath: item.artUri != null && item.artUri!.scheme == 'file' ? item.artUri!.toFilePath() : null,
+        durationMs: item.duration?.inMilliseconds,
+      )
+    ];
+    for (final n in names) {
+      await store.addOrCreate(n, entries);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('last_playlist_names', names);
+  }
+
+  Future<List<String>> _choosePlaylistNames(BuildContext context, PlaylistStore store) async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastList = prefs.getStringList('last_playlist_names') ?? [];
+    final names = store.playlists.map((e) => e.name).toList();
+    final recent = lastList.where((n) => names.contains(n)).toList();
+    final other = names.where((n) => !recent.contains(n)).toList();
+    final ordered = [...recent, ...other];
+    final selected = <String>{...recent};
+    final controller = TextEditingController();
+    return showDialog<List<String>>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('添加到歌单（可多选）'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (ordered.isNotEmpty)
+                SizedBox(
+                  height: 200,
+                  width: double.maxFinite,
+                  child: ListView.builder(
+                    itemCount: ordered.length,
+                    itemBuilder: (context, index) {
+                      final n = ordered[index];
+                      return CheckboxListTile(
+                        value: selected.contains(n),
+                        title: Text(n),
+                        onChanged: (v) => setState(() {
+                          if (v == true) {
+                            selected.add(n);
+                          } else {
+                            selected.remove(n);
+                          }
+                        }),
+                      );
+                    },
+                  ),
+                ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: controller,
+                decoration: const InputDecoration(
+                  hintText: '或输入新歌单名称',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
+            FilledButton(
+              onPressed: () {
+                final newName = controller.text.trim();
+                if (newName.isNotEmpty) selected.add(newName);
+                Navigator.pop(context, selected.toList());
+              },
+              child: const Text('确定'),
+            ),
+          ],
+        ),
+      ),
+    ).then((value) => value ?? <String>[]);
+  }
+
+  void _showPickedDetail(BuildContext context, _PickedAudio item) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('文件详情'),
+        content: SelectableText([
+          '标题：${item.title}',
+          '歌手：${item.artist ?? '未知'}',
+          if (item.duration != null) '时长：${_fmt(item.duration!)}',
+          '路径：${item.uri.toFilePath()}',
+        ].join('\n')),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('关闭'))],
+      ),
+    );
+  }
+
+  Future<void> _openPickedFile(_PickedAudio item) async {
+    if (item.uri.scheme == 'file') {
+      await OpenFilex.open(item.uri.toFilePath());
+    }
+  }
+
+  void _showSongDetail(BuildContext context, SongModel s) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('歌曲详情'),
+        content: SelectableText([
+          '标题：${s.title}',
+          '歌手：${s.artist ?? '未知'}',
+          if ((s.duration ?? 0) > 0) '时长：${_fmt(Duration(milliseconds: s.duration!))}',
+          if (s.uri != null) 'URI：${s.uri}',
+          'ID：${s.id}',
+        ].join('\n')),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('关闭'))],
+      ),
+    );
+  }
+
+  Future<void> _openAndroidSong(SongModel s) async {
+    final uri = s.uri;
+    if (uri == null) return;
+    await OpenFilex.open(uri);
+  }
+
+  Future<void> _locateInPlaylistByUri(String uri) async {
+    if (uri.isEmpty) return;
+    final store = context.read<PlaylistStore>();
+    final candidates = store.playlists.where((p) => p.items.any((it) => it.uri == uri)).toList();
+    if (candidates.isEmpty) {
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('未在任何歌单中找到'),));
+      return;
+    }
+    final chosen = await showDialog<String>(
+      context: context,
+      builder: (_) => SimpleDialog(
+        title: const Text('选择歌单'),
+        children: [
+          for (final p in candidates)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(context, p.id),
+              child: Text(p.name),
+            )
+        ],
+      ),
+    );
+    if (chosen == null) return;
+    if (!mounted) return;
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => PlaylistDetailPage(playlistId: chosen, highlightUri: uri)));
+  }
+
+  Future<void> _removeFromPlaylistsByUri(String uri) async {
+    if (uri.isEmpty) return;
+    final store = context.read<PlaylistStore>();
+    final candidates = store.playlists.where((p) => p.items.any((it) => it.uri == uri)).toList();
+    if (candidates.isEmpty) return;
+    final selected = <String>{};
+    final ids = await showDialog<List<String>>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('从歌单中移除'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                for (final p in candidates)
+                  CheckboxListTile(
+                    value: selected.contains(p.id),
+                    title: Text(p.name),
+                    onChanged: (v) => setState(() {
+                      if (v == true) {
+                        selected.add(p.id);
+                      } else {
+                        selected.remove(p.id);
+                      }
+                    }),
+                  )
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, <String>[]), child: const Text('取消')),
+            FilledButton(onPressed: () => Navigator.pop(context, selected.toList()), child: const Text('确定')),
+          ],
+        ),
+      ),
+    );
+    if (ids == null || ids.isEmpty) return;
+    for (final id in ids) {
+      await store.removeByUris(id, {uri});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final player = context.watch<PlayerController>();
+    final handler = context.watch<AudioHandler>();
+    final isIOS = Platform.isIOS;
+    final List<_PickedAudio> iosList = isIOS
+        ? _picked.where((e) {
+            final matchesQuery = _query.isEmpty || e.title.toLowerCase().contains(_query.toLowerCase()) || (e.artist ?? '').toLowerCase().contains(_query.toLowerCase());
+            final key = e.uri.toString();
+            final likedOk = !_onlyLiked || player.isLikedKey(key);
+            final favOk = !_onlyFavorite || player.isFavoriteKey(key);
+            return matchesQuery && likedOk && favOk;
+          }).toList()
+        : const [];
+    final List<SongModel> androidList = !isIOS
+        ? _songs.where((s) {
+            final matchesQuery = _query.isEmpty || s.title.toLowerCase().contains(_query.toLowerCase()) || (s.artist ?? '').toLowerCase().contains(_query.toLowerCase());
+            final likedOk = !_onlyLiked || player.isLiked(s.id);
+            final favOk = !_onlyFavorite || player.isFavorite(s.id);
+            return matchesQuery && likedOk && favOk;
+          }).toList()
+        : const [];
+    _applySort(iosList, androidList);
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Walkman'),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                if (isIOS)
+                  OutlinedButton(
+                    onPressed: _pickFiles,
+                    child: const Text('导入音频'),
+                  ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: (isIOS ? _picked.isEmpty : _songs.isEmpty)
+                      ? null
+                      : () {
+                          if (isIOS) {
+                            final uris = _picked.map((e) => e.uri).toList();
+                            final titles = _picked.map((e) => e.title).toList();
+                            player.setPlaylistFromUris(uris, titles: titles);
+                          } else {
+                            player.setPlaylist(_songs);
+                          }
+                          player.play();
+                        },
+                  child: const Text('播放'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonal(
+                  onPressed: player.pause,
+                  child: const Text('暂停'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton(
+                  onPressed: player.next,
+                  child: const Text('下一首'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton(
+                  onPressed: player.previous,
+                  child: const Text('上一首'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    decoration: const InputDecoration(
+                      prefixIcon: Icon(Icons.search),
+                      hintText: '搜索标题或歌手',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onChanged: (v) => setState(() => _query = v),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                DropdownButton<_SortMode>(
+                  value: _sortMode,
+                  onChanged: (m) => setState(() => _sortMode = m!),
+                  items: [
+                    DropdownMenuItem(value: _SortMode.titleAsc, child: const Text('标题 ↑')),
+                    DropdownMenuItem(value: _SortMode.titleDesc, child: const Text('标题 ↓')),
+                    DropdownMenuItem(value: _SortMode.artistAsc, child: const Text('歌手 ↑')),
+                    DropdownMenuItem(value: _SortMode.artistDesc, child: const Text('歌手 ↓')),
+                    DropdownMenuItem(value: _SortMode.durationAsc, child: const Text('时长 ↑')),
+                    DropdownMenuItem(value: _SortMode.durationDesc, child: const Text('时长 ↓')),
+                  ],
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('只看喜欢'),
+                  selected: _onlyLiked,
+                  onSelected: (v) => setState(() => _onlyLiked = v),
+                ),
+                const SizedBox(width: 8),
+                FilterChip(
+                  label: const Text('只看收藏'),
+                  selected: _onlyFavorite,
+                  onSelected: (v) => setState(() => _onlyFavorite = v),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            MiniPlayer(handler: handler),
+            const SizedBox(height: 8),
+            if (_selected.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text('已选 ${_selected.length} 项'),
+                    OutlinedButton(
+                      onPressed: _selectAll,
+                      child: const Text('全选'),
+                    ),
+                    FilledButton.tonal(
+                      onPressed: () => _batchLike(player, true),
+                      child: const Text('喜欢'),
+                    ),
+                    FilledButton.tonal(
+                      onPressed: () => _batchLike(player, false),
+                      child: const Text('取消喜欢'),
+                    ),
+                    OutlinedButton(
+                      onPressed: () => _batchFavorite(player, true),
+                      child: const Text('收藏'),
+                    ),
+                    OutlinedButton(
+                      onPressed: () => _batchFavorite(player, false),
+                      child: const Text('取消收藏'),
+                    ),
+                    OutlinedButton(
+                      onPressed: () => _addToPlaylist(context),
+                      child: const Text('添加到歌单'),
+                    ),
+                    FilledButton(
+                      onPressed: () => _playSelection(player),
+                      child: const Text('播放所选'),
+                    ),
+                    if (isIOS)
+                      TextButton(
+                        onPressed: _deleteSelection,
+                        child: const Text('删除所选'),
+                      ),
+                    TextButton(
+                      onPressed: _clearSelection,
+                      child: const Text('清空'),
+                    ),
+                  ],
+                ),
+              ),
+            if (_loading)
+              const Expanded(
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (!isIOS && _songs.isEmpty)
+              const Expanded(
+                child: Center(
+                  child: Text(
+                    '未发现本地音乐文件',
+                  ),
+                ),
+              )
+            else if (isIOS && _picked.isEmpty)
+              const Expanded(
+                child: Center(
+                  child: Text('请先导入音频文件'),
+                ),
+              )
+            else
+              Expanded(
+                child: ListView.separated(
+                  itemCount: isIOS ? iosList.length : androidList.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    if (isIOS) {
+                      final item = iosList[index];
+                      final key = item.uri.toString();
+                      final liked = player.isLikedKey(key);
+                      final favorite = player.isFavoriteKey(key);
+                      return ListTile(
+                        leading: _leadingArtForPicked(item),
+                        selected: _selected.contains(key),
+                        onLongPress: () => _toggleSelectKey(key),
+                        onTap: () {
+                          if (_selected.isNotEmpty) {
+                            _toggleSelectKey(key);
+                          } else {
+                            final uris = iosList.map((e) => e.uri).toList();
+                            final titles = iosList.map((e) => e.title).toList();
+                            player.setPlaylistFromUris(uris, titles: titles, startIndex: index);
+                            player.play();
+                          }
+                        },
+                        title: Text(item.title),
+                        subtitle: Text([
+                          item.artist ?? '本地文件',
+                          if (item.duration != null) _fmt(item.duration!)
+                        ].join(' · ')),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              onPressed: () => player.toggleLikeKey(key),
+                              icon: Icon(
+                                liked ? Icons.favorite : Icons.favorite_border,
+                                color: liked ? Colors.red : null,
+                              ),
+                            ),
+                            IconButton(
+                              onPressed: () => player.toggleFavoriteKey(key),
+                              icon: Icon(
+                                favorite ? Icons.bookmark : Icons.bookmark_border,
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: '添加到歌单',
+                              onPressed: () => _addSinglePickedToPlaylist(context, item),
+                              icon: const Icon(Icons.playlist_add),
+                            ),
+                        PopupMenuButton<String>(
+                          onSelected: (v) {
+                            if (v == 'detail') _showPickedDetail(context, item);
+                            if (v == 'open') _openPickedFile(item);
+                          },
+                          itemBuilder: (context) => const [
+                            PopupMenuItem(value: 'detail', child: Text('查看详情')),
+                            PopupMenuItem(value: 'open', child: Text('在文件中打开')),
+                          ],
+                        ),
+                          ],
+                        ),
+                      );
+                    } else {
+                      final s = androidList[index];
+                      final liked = player.isLiked(s.id);
+                      final favorite = player.isFavorite(s.id);
+                      final key = s.id.toString();
+                      return ListTile(
+                        leading: QueryArtworkWidget(
+                          id: s.id,
+                          type: ArtworkType.AUDIO,
+                          nullArtworkWidget: const _PlaceholderArt(),
+                        ),
+                        selected: _selected.contains(key),
+                        onLongPress: () => _toggleSelectKey(key),
+                        onTap: () {
+                          if (_selected.isNotEmpty) {
+                            _toggleSelectKey(key);
+                          } else {
+                            player.setPlaylist(androidList, startIndex: index);
+                            player.play();
+                          }
+                        },
+                        title: Text(s.title),
+                        subtitle: Text([
+                          s.artist ?? '未知',
+                          if ((s.duration ?? 0) > 0)
+                            _fmt(Duration(milliseconds: s.duration!))
+                        ].join(' · ')),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              onPressed: () => player.toggleLike(s.id),
+                              icon: Icon(
+                                liked ? Icons.favorite : Icons.favorite_border,
+                                color: liked ? Colors.red : null,
+                              ),
+                            ),
+                            IconButton(
+                              onPressed: () => player.toggleFavorite(s.id),
+                              icon: Icon(
+                                favorite ? Icons.bookmark : Icons.bookmark_border,
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: '添加到歌单',
+                              onPressed: () => _addSingleSongToPlaylist(context, s),
+                              icon: const Icon(Icons.playlist_add),
+                            ),
+                            PopupMenuButton<String>(
+                              onSelected: (v) {
+                                if (v == 'detail') _showSongDetail(context, s);
+                            if (v == 'open') _openAndroidSong(s);
+                            if (v == 'locate') _locateInPlaylistByUri(s.uri ?? '');
+                            if (v == 'remove_from_playlist') _removeFromPlaylistsByUri(s.uri ?? '');
+                              },
+                          itemBuilder: (context) => const [
+                            PopupMenuItem(value: 'detail', child: Text('查看详情')),
+                            PopupMenuItem(value: 'open', child: Text('打开文件')),
+                            PopupMenuItem(value: 'locate', child: Text('定位到歌单位置')),
+                            PopupMenuItem(value: 'remove_from_playlist', child: Text('从歌单移除…')),
+                          ],
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _applySort(List<_PickedAudio> iosList, List<SongModel> androidList) {
+    int cmpStr(String a, String b) => a.toLowerCase().compareTo(b.toLowerCase());
+    switch (_sortMode) {
+      case _SortMode.titleAsc:
+        iosList.sort((a, b) => cmpStr(a.title, b.title));
+        androidList.sort((a, b) => cmpStr(a.title, b.title));
+        break;
+      case _SortMode.titleDesc:
+        iosList.sort((a, b) => cmpStr(b.title, a.title));
+        androidList.sort((a, b) => cmpStr(b.title, a.title));
+        break;
+      case _SortMode.artistAsc:
+        iosList.sort((a, b) => cmpStr(a.artist ?? '', b.artist ?? ''));
+        androidList.sort((a, b) => cmpStr(a.artist ?? '', b.artist ?? ''));
+        break;
+      case _SortMode.artistDesc:
+        iosList.sort((a, b) => cmpStr(b.artist ?? '', a.artist ?? ''));
+        androidList.sort((a, b) => cmpStr(b.artist ?? '', a.artist ?? ''));
+        break;
+      case _SortMode.durationAsc:
+        iosList.sort((a, b) => (a.duration?.inMilliseconds ?? 0).compareTo(b.duration?.inMilliseconds ?? 0));
+        androidList.sort((a, b) => (a.duration ?? 0).compareTo(b.duration ?? 0));
+        break;
+      case _SortMode.durationDesc:
+        iosList.sort((a, b) => (b.duration?.inMilliseconds ?? 0).compareTo(a.duration?.inMilliseconds ?? 0));
+        androidList.sort((a, b) => (b.duration ?? 0).compareTo(a.duration ?? 0));
+        break;
+    }
+  }
+
+  Future<void> _addToPlaylist(BuildContext context) async {
+    final store = context.read<PlaylistStore>();
+    final names = await _choosePlaylistNames(context, store);
+    if (names.isEmpty) return;
+    final items = <PlaylistItem>[];
+    if (Platform.isIOS) {
+      final set = _selected.toSet();
+      final list = _picked.where((e) => set.contains(e.uri.toString())).toList();
+      for (final it in list) {
+        items.add(PlaylistItem(
+          uri: it.uri.toString(),
+          title: it.title,
+          artist: it.artist,
+          artPath: it.artUri != null && it.artUri!.scheme == 'file' ? it.artUri!.toFilePath() : null,
+          durationMs: it.duration?.inMilliseconds,
+        ));
+      }
+    } else {
+      final ids = _selected.map((k) => int.tryParse(k)).whereType<int>().toSet();
+      final list = _songs.where((s) => ids.contains(s.id)).toList();
+      for (final s in list) {
+        items.add(PlaylistItem(
+          uri: s.uri!,
+          title: s.title,
+          artist: s.artist,
+          durationMs: s.duration,
+        ));
+      }
+    }
+    for (final n in names) {
+      await store.addOrCreate(n, items);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('last_playlist_names', names);
+    _clearSelection();
+  }
+}
+
+enum _SortMode { titleAsc, titleDesc, artistAsc, artistDesc, durationAsc, durationDesc }
+class _PickedAudio {
+  final Uri uri;
+  final String title;
+  final Uri? artUri;
+  final String? artist;
+  final Duration? duration;
+  _PickedAudio({
+    required this.uri,
+    required this.title,
+    this.artUri,
+    this.artist,
+    this.duration,
+  });
+}
+
+class MiniPlayer extends StatelessWidget {
+  final AudioHandler handler;
+  const MiniPlayer({super.key, required this.handler});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<MediaItem?>(
+      stream: handler.mediaItem,
+      builder: (context, snapItem) {
+        final item = snapItem.data;
+        return StreamBuilder<PlaybackState>(
+          stream: handler.playbackState,
+          builder: (context, snapState) {
+            final player = context.watch<PlayerController>();
+            final state = snapState.data;
+            final playing = state?.playing ?? false;
+            final position = state?.updatePosition ?? Duration.zero;
+            final duration = item?.duration ?? Duration.zero;
+            final canSeek = duration > Duration.zero;
+            return Material(
+              color: Theme.of(context).colorScheme.surfaceContainerLow,
+              borderRadius: BorderRadius.circular(8),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        IconButton(
+                          tooltip: '播放模式',
+                          onPressed: () => player.cyclePlayMode(),
+                          icon: Icon(_modeIcon(player.mode)),
+                        ),
+                        _ArtworkThumb(item: item),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            item?.title ?? '未播放',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => handler.skipToPrevious(),
+                          icon: const Icon(Icons.skip_previous),
+                        ),
+                        IconButton(
+                          onPressed: () => playing ? handler.pause() : handler.play(),
+                          icon: Icon(playing ? Icons.pause_circle_filled : Icons.play_circle_fill),
+                        ),
+                        IconButton(
+                          onPressed: () => handler.skipToNext(),
+                          icon: const Icon(Icons.skip_next),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Text(_fmt(position), style: Theme.of(context).textTheme.bodySmall),
+                        Expanded(
+                          child: Slider(
+                            value: position.inMilliseconds.clamp(0, duration.inMilliseconds).toDouble(),
+                            max: (duration.inMilliseconds > 0 ? duration.inMilliseconds : 1).toDouble(),
+                            onChanged: canSeek
+                                ? (v) => handler.seek(Duration(milliseconds: v.round()))
+                                : null,
+                          ),
+                        ),
+                        Text(_fmt(duration), style: Theme.of(context).textTheme.bodySmall),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+String _fmt(Duration d) {
+  final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+  final h = d.inHours;
+  if (h > 0) {
+    return '${h.toString().padLeft(2, '0')}:$m:$s';
+  }
+  return '$m:$s';
+}
+
+IconData _modeIcon(PlayMode m) {
+  switch (m) {
+    case PlayMode.sequence:
+      return Icons.repeat;
+    case PlayMode.shuffle:
+      return Icons.shuffle;
+    case PlayMode.single:
+      return Icons.repeat_one;
+  }
+}
+
+class _ArtworkThumb extends StatelessWidget {
+  final MediaItem? item;
+  const _ArtworkThumb({required this.item});
+
+  @override
+  Widget build(BuildContext context) {
+    final extras = item?.extras;
+    if (item?.artUri != null) {
+      final uri = item!.artUri!;
+      if (uri.scheme == 'file') {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.file(
+            File.fromUri(uri),
+            width: 40,
+            height: 40,
+            fit: BoxFit.cover,
+          ),
+        );
+      }
+      if (uri.scheme == 'http' || uri.scheme == 'https') {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.network(
+            uri.toString(),
+            width: 40,
+            height: 40,
+            fit: BoxFit.cover,
+          ),
+        );
+      }
+    }
+    if (Platform.isAndroid && extras != null && extras['songId'] != null) {
+      final int songId = extras['songId'] as int;
+      return QueryArtworkWidget(
+        id: songId,
+        type: ArtworkType.AUDIO,
+        nullArtworkWidget: const _PlaceholderArt(),
+        artworkHeight: 40,
+        artworkWidth: 40,
+      );
+    }
+    return const _PlaceholderArt();
+  }
+}
+
+class _PlaceholderArt extends StatelessWidget {
+  const _PlaceholderArt();
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(6),
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      ),
+      child: const Icon(Icons.music_note),
+    );
+  }
+}
+
+Widget _leadingArtForPicked(_PickedAudio item) {
+  if (item.artUri != null) {
+    final uri = item.artUri!;
+    if (uri.scheme == 'file') {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: Image.file(
+          File.fromUri(uri),
+          width: 40,
+          height: 40,
+          fit: BoxFit.cover,
+        ),
+      );
+    }
+    if (uri.scheme == 'http' || uri.scheme == 'https') {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(6),
+        child: Image.network(
+          uri.toString(),
+          width: 40,
+          height: 40,
+          fit: BoxFit.cover,
+        ),
+      );
+    }
+  }
+  return const _PlaceholderArt();
+}
+
+String _safeName(String input) {
+  final s = input.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+  return s.length > 64 ? s.substring(s.length - 64) : s;
+}
+
+class NowPlayingListener extends StatelessWidget {
+  final Widget child;
+  const NowPlayingListener({super.key, required this.child});
+  @override
+  Widget build(BuildContext context) {
+    final handler = context.watch<AudioHandler>();
+    return StreamBuilder<MediaItem?>(
+      stream: handler.mediaItem,
+      builder: (context, snapshot) {
+        final item = snapshot.data;
+        if (item != null) {
+          // Save to recent history
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            final store = context.read<PlaylistStore>();
+            final artUri = item.artUri;
+            store.addHistory(
+              PlaylistItem(
+                uri: item.id,
+                title: item.title,
+                artist: item.artist,
+                artPath: artUri != null && artUri.scheme == 'file' ? artUri.toFilePath() : null,
+                durationMs: item.duration?.inMilliseconds,
+              ),
+            );
+          });
+        }
+        return child;
+      },
+    );
+  }
+}
