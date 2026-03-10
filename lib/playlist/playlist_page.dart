@@ -1,11 +1,11 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:audio_service/audio_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../player/player_controller.dart';
 import 'playlist_store.dart';
+import '../local/local_library_page.dart';
 
 class PlaylistPage extends StatelessWidget {
   const PlaylistPage({super.key});
@@ -27,7 +27,7 @@ class PlaylistPage extends StatelessWidget {
         const SizedBox(height: 8),
         Expanded(
           child: ListView.separated(
-            itemCount: store.playlists.length + 1,
+            itemCount: store.playlists.length + 2,
             separatorBuilder: (_, __) => const Divider(height: 1),
             itemBuilder: (context, index) {
               if (index == 0) {
@@ -46,7 +46,15 @@ class PlaylistPage extends StatelessWidget {
                   ),
                 );
               }
-              final p = store.playlists[index - 1];
+              if (index == 1) {
+                return ListTile(
+                  leading: const Icon(Icons.folder),
+                  title: const Text('本地目录'),
+                  subtitle: const Text('应用存储中的音乐文件'),
+                  onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LocalLibraryPage())),
+                );
+              }
+              final p = store.playlists[index - 2];
               return ListTile(
                 title: Text(p.name),
                 subtitle: Text('${p.items.length} 首'),
@@ -335,7 +343,7 @@ class _PlaceholderArt extends StatelessWidget {
       height: 40,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(6),
-        color: Theme.of(context).colorScheme.surfaceVariant,
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
       ),
       child: const Icon(Icons.music_note),
     );

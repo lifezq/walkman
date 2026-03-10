@@ -4,7 +4,6 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:on_audio_query/on_audio_query.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio_background/just_audio_background.dart';
@@ -13,29 +12,40 @@ import 'package:metadata_god/metadata_god.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
 import 'package:open_filex/open_filex.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import 'player/player_controller.dart';
 import 'player/audio_handler.dart';
 import 'playlist/playlist_store.dart';
 import 'playlist/playlist_page.dart';
 import 'player/play_mode.dart';
+import 'player/full_player_page.dart';
+import 'settings/settings_store.dart';
+import 'settings/settings_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await MetadataGod.initialize();
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.lifezq.walkman.channel.audio',
-    androidNotificationChannelName: '音频播放',
-    androidNotificationOngoing: true,
-  );
-  final audioHandler = await AudioService.init(
-    builder: () => MyAudioHandler(),
-    config: const AudioServiceConfig(
+  try {
+    await JustAudioBackground.init(
       androidNotificationChannelId: 'com.lifezq.walkman.channel.audio',
       androidNotificationChannelName: '音频播放',
       androidNotificationOngoing: true,
-    ),
-  );
+    );
+  } catch (_) {}
+  AudioHandler audioHandler;
+  try {
+    audioHandler = await AudioService.init(
+      builder: () => MyAudioHandler(),
+      config: const AudioServiceConfig(
+        androidNotificationChannelId: 'com.lifezq.walkman.channel.audio',
+        androidNotificationChannelName: '音频播放',
+        androidNotificationOngoing: true,
+      ),
+    );
+  } catch (_) {
+    audioHandler = MyAudioHandler();
+  }
   runApp(WalkmanApp(audioHandler: audioHandler));
 }
 
@@ -50,6 +60,7 @@ class WalkmanApp extends StatelessWidget {
         Provider<AudioHandler>.value(value: audioHandler),
         ChangeNotifierProvider(create: (_) => PlayerController(audioHandler as MyAudioHandler)),
         ChangeNotifierProvider(create: (_) => PlaylistStore()..load()),
+        ChangeNotifierProvider(create: (_) => SettingsStore()..load()),
       ],
       child: MaterialApp(
         title: 'Walkman',
@@ -106,20 +117,21 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    _init();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _init();
+      }
+    });
   }
 
   Future<void> _init() async {
     if (Platform.isAndroid) {
-      await Permission.notification.request();
-      final audioStatus = await Permission.audio.request();
-      final storageStatus = await Permission.storage.request();
-      if (!audioStatus.isGranted && !storageStatus.isGranted) {
-        setState(() {
-          _loading = false;
-        });
-        return;
-      }
+      try {
+        final ok = await _audioQuery.permissionsStatus();
+        if (!ok) {
+          await _audioQuery.permissionsRequest();
+        }
+      } catch (_) {}
     }
     List<SongModel> songs = [];
     if (Platform.isAndroid) {
@@ -349,7 +361,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<String?> _searchArtworkUrl(String title, String? artist) async {
     try {
-      final term = Uri.encodeComponent([title, if (artist != null) artist].where((e) => e != null && e.isNotEmpty).join(' '));
+      final term = Uri.encodeComponent([title, if (artist != null) artist].where((e) => e.isNotEmpty).join(' '));
       final url = 'https://itunes.apple.com/search?media=music&limit=1&term=$term';
       final res = await http.get(Uri.parse(url));
       if (res.statusCode == 200) {
@@ -589,7 +601,7 @@ class _HomePageState extends State<HomePage> {
             final favOk = !_onlyFavorite || player.isFavoriteKey(key);
             return matchesQuery && likedOk && favOk;
           }).toList()
-        : const [];
+        : <_PickedAudio>[];
     final List<SongModel> androidList = !isIOS
         ? _songs.where((s) {
             final matchesQuery = _query.isEmpty || s.title.toLowerCase().contains(_query.toLowerCase()) || (s.artist ?? '').toLowerCase().contains(_query.toLowerCase());
@@ -597,28 +609,49 @@ class _HomePageState extends State<HomePage> {
             final favOk = !_onlyFavorite || player.isFavorite(s.id);
             return matchesQuery && likedOk && favOk;
           }).toList()
-        : const [];
+        : <SongModel>[];
     _applySort(iosList, androidList);
     return Scaffold(
       appBar: AppBar(
         title: const Text('Walkman'),
+        actions: [
+          IconButton(
+            onPressed: () {
+              Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SettingsPage()));
+            },
+            icon: const Icon(Icons.settings),
+            tooltip: '设置',
+          ),
+        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
-            Row(
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
               children: [
                 if (isIOS)
                   OutlinedButton(
                     onPressed: _pickFiles,
                     child: const Text('导入音频'),
                   ),
-                const SizedBox(width: 8),
+                if (isIOS)
+                  OutlinedButton(
+                    onPressed: _scanDirectory,
+                    child: const Text('扫描文件夹'),
+                  ),
+                if (!isIOS)
+                  OutlinedButton(
+                    onPressed: _scanAndroid,
+                    child: const Text('扫描本地音乐'),
+                  ),
                 FilledButton(
                   onPressed: (isIOS ? _picked.isEmpty : _songs.isEmpty)
                       ? null
                       : () {
+                            _ensureNotificationPermission();
                           if (isIOS) {
                             final uris = _picked.map((e) => e.uri).toList();
                             final titles = _picked.map((e) => e.title).toList();
@@ -630,20 +663,23 @@ class _HomePageState extends State<HomePage> {
                         },
                   child: const Text('播放'),
                 ),
-                const SizedBox(width: 8),
                 FilledButton.tonal(
                   onPressed: player.pause,
                   child: const Text('暂停'),
                 ),
-                const SizedBox(width: 8),
                 OutlinedButton(
                   onPressed: player.next,
                   child: const Text('下一首'),
                 ),
-                const SizedBox(width: 8),
                 OutlinedButton(
                   onPressed: player.previous,
                   child: const Text('上一首'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    _handleUploadTap();
+                  },
+                  child: const Text('上传'),
                 ),
               ],
             ),
@@ -665,13 +701,13 @@ class _HomePageState extends State<HomePage> {
                 DropdownButton<_SortMode>(
                   value: _sortMode,
                   onChanged: (m) => setState(() => _sortMode = m!),
-                  items: [
-                    DropdownMenuItem(value: _SortMode.titleAsc, child: const Text('标题 ↑')),
-                    DropdownMenuItem(value: _SortMode.titleDesc, child: const Text('标题 ↓')),
-                    DropdownMenuItem(value: _SortMode.artistAsc, child: const Text('歌手 ↑')),
-                    DropdownMenuItem(value: _SortMode.artistDesc, child: const Text('歌手 ↓')),
-                    DropdownMenuItem(value: _SortMode.durationAsc, child: const Text('时长 ↑')),
-                    DropdownMenuItem(value: _SortMode.durationDesc, child: const Text('时长 ↓')),
+                  items: const [
+                    DropdownMenuItem(value: _SortMode.titleAsc, child: Text('标题 ↑')),
+                    DropdownMenuItem(value: _SortMode.titleDesc, child: Text('标题 ↓')),
+                    DropdownMenuItem(value: _SortMode.artistAsc, child: Text('歌手 ↑')),
+                    DropdownMenuItem(value: _SortMode.artistDesc, child: Text('歌手 ↓')),
+                    DropdownMenuItem(value: _SortMode.durationAsc, child: Text('时长 ↑')),
+                    DropdownMenuItem(value: _SortMode.durationDesc, child: Text('时长 ↓')),
                   ],
                 ),
                 const SizedBox(width: 8),
@@ -770,7 +806,17 @@ class _HomePageState extends State<HomePage> {
                       final liked = player.isLikedKey(key);
                       final favorite = player.isFavoriteKey(key);
                       return ListTile(
-                        leading: _leadingArtForPicked(item),
+                        leading: GestureDetector(
+                          onTap: () async {
+                            final uris = iosList.map((e) => e.uri).toList();
+                            final titles = iosList.map((e) => e.title).toList();
+                            await player.setPlaylistFromUris(uris, titles: titles, startIndex: index);
+                            await player.play();
+                            if (!mounted) return;
+                            FullPlayerPage.open(context);
+                          },
+                          child: _leadingArtForPicked(item),
+                        ),
                         selected: _selected.contains(key),
                         onLongPress: () => _toggleSelectKey(key),
                         onTap: () {
@@ -828,10 +874,18 @@ class _HomePageState extends State<HomePage> {
                       final favorite = player.isFavorite(s.id);
                       final key = s.id.toString();
                       return ListTile(
-                        leading: QueryArtworkWidget(
-                          id: s.id,
-                          type: ArtworkType.AUDIO,
-                          nullArtworkWidget: const _PlaceholderArt(),
+                        leading: GestureDetector(
+                          onTap: () async {
+                            await player.setPlaylist(androidList, startIndex: index);
+                            await player.play();
+                            if (!mounted) return;
+                            FullPlayerPage.open(context);
+                          },
+                          child: QueryArtworkWidget(
+                            id: s.id,
+                            type: ArtworkType.AUDIO,
+                            nullArtworkWidget: const _PlaceholderArt(),
+                          ),
                         ),
                         selected: _selected.contains(key),
                         onLongPress: () => _toggleSelectKey(key),
@@ -876,12 +930,14 @@ class _HomePageState extends State<HomePage> {
                             if (v == 'open') _openAndroidSong(s);
                             if (v == 'locate') _locateInPlaylistByUri(s.uri ?? '');
                             if (v == 'remove_from_playlist') _removeFromPlaylistsByUri(s.uri ?? '');
+                            if (v == 'save_local') _saveAndroidSongToLocal(s);
                               },
                           itemBuilder: (context) => const [
                             PopupMenuItem(value: 'detail', child: Text('查看详情')),
                             PopupMenuItem(value: 'open', child: Text('打开文件')),
                             PopupMenuItem(value: 'locate', child: Text('定位到歌单位置')),
                             PopupMenuItem(value: 'remove_from_playlist', child: Text('从歌单移除…')),
+                            PopupMenuItem(value: 'save_local', child: Text('保存到本地库')),
                           ],
                             ),
                           ],
@@ -963,6 +1019,426 @@ class _HomePageState extends State<HomePage> {
     await prefs.setStringList('last_playlist_names', names);
     _clearSelection();
   }
+
+  Future<void> _scanAndroid() async {
+    try {
+      final ok = await _audioQuery.permissionsStatus();
+      if (!ok) {
+        await _audioQuery.permissionsRequest();
+      }
+      final songs = await _audioQuery.querySongs(
+        sortType: SongSortType.DATE_ADDED,
+        orderType: OrderType.DESC_OR_GREATER,
+        uriType: UriType.EXTERNAL,
+        ignoreCase: true,
+      );
+      setState(() {
+        _songs = songs;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _scanDirectory() async {
+    final dir = await FilePicker.platform.getDirectoryPath();
+    if (dir == null) return;
+    final exts = ['.mp3', '.aac', '.m4a', '.wav', '.flac', '.ogg'];
+    final list = <_PickedAudio>[];
+    try {
+      final temp = await getTemporaryDirectory();
+      final d = Directory(dir);
+      await for (final ent in d.list(recursive: true, followLinks: false)) {
+        if (ent is File) {
+          final name = ent.uri.pathSegments.isNotEmpty ? ent.uri.pathSegments.last : ent.path;
+          final lower = name.toLowerCase();
+          if (!exts.any((e) => lower.endsWith(e))) continue;
+          Uri? artUri;
+          String? artist;
+          Duration? duration;
+          try {
+            final meta = await MetadataGod.readMetadata(file: ent.path);
+            artist = meta.artist;
+            if (meta.durationMs != null) {
+              final ms = meta.durationMs!;
+              final int intMs = ms is int ? ms as int : (ms as num).round();
+              duration = Duration(milliseconds: intMs);
+            }
+            if (meta.picture != null && meta.picture!.data.isNotEmpty) {
+              final file = File('${temp.path}/art_${_safeName(ent.path)}.jpg');
+              await file.writeAsBytes(meta.picture!.data);
+              artUri = file.uri;
+            }
+          } catch (_) {}
+          list.add(_PickedAudio(uri: ent.uri, title: name, artUri: artUri, artist: artist, duration: duration));
+        }
+      }
+    } catch (_) {}
+    if (list.isEmpty) return;
+    setState(() {
+      _picked = list;
+    });
+    await _saveImportedList();
+  }
+
+  Future<void> _ensureNotificationPermission() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final status = await Permission.notification.status;
+      if (!status.isGranted) {
+        await Permission.notification.request();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveAndroidSongToLocal(SongModel s) async {
+    final path = s.data;
+    if (path.isEmpty) return;
+    final file = File(path);
+    if (!await file.exists()) return;
+    try {
+      final dst = await _copyToLibrary(file);
+      final item = PlaylistItem(
+        uri: dst.uri.toString(),
+        title: s.title,
+        artist: s.artist,
+        durationMs: s.duration,
+      );
+      await context.read<PlaylistStore>().addOrCreate('本地库', [item]);
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('已保存至“本地库”歌单')));
+    } catch (_) {
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('保存失败')));
+    }
+  }
+
+  Future<void> _uploadPicked(_PickedAudio item) async {
+    if (item.uri.scheme != 'file') return;
+    final file = File(item.uri.toFilePath());
+    if (!await file.exists()) return;
+    final name = file.path.split('/').last;
+    await _uploadFile(file, filename: name, title: item.title, artist: item.artist);
+  }
+
+  Future<void> _uploadFile(File file, {required String filename, String? title, String? artist}) async {
+    final store = context.read<SettingsStore>();
+    final ep = store.endpoint;
+    if (ep == null || ep.isEmpty) {
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('请先在设置中配置上传服务器地址')));
+      return;
+    }
+    final ok = await _uploadFileCore(file, endpoint: ep, filename: filename, title: title, artist: artist);
+    if (!mounted) return;
+    showDialog(context: context, builder: (_) => AlertDialog(content: Text(ok ? '上传成功' : '上传失败')));
+  }
+
+  Future<bool> _uploadFileCore(File file, {required String endpoint, required String filename, String? title, String? artist}) async {
+    try {
+      final uri = Uri.parse(endpoint);
+      final req = http.MultipartRequest('POST', uri);
+      req.files.add(await http.MultipartFile.fromPath('file', file.path, filename: filename));
+      if (title != null) req.fields['title'] = title;
+      if (artist != null) req.fields['artist'] = artist;
+      final res = await req.send();
+      return res.statusCode >= 200 && res.statusCode < 300;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _batchUploadSelected() async {
+    final store = context.read<SettingsStore>();
+    final ep = store.endpoint;
+    if (ep == null || ep.isEmpty) {
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('请先在设置中配置上传服务器地址')));
+      return;
+    }
+    final items = <Map<String, dynamic>>[];
+    if (Platform.isIOS) {
+      final keys = _selected.toSet();
+      for (final it in _picked.where((e) => keys.contains(e.uri.toString()))) {
+        if (it.uri.scheme != 'file') continue;
+        final file = File(it.uri.toFilePath());
+        if (await file.exists()) {
+          items.add({'file': file, 'filename': file.path.split('/').last, 'title': it.title, 'artist': it.artist});
+        }
+      }
+    } else {
+      final ids = _selected.map((k) => int.tryParse(k)).whereType<int>().toSet();
+      for (final s in _songs.where((e) => ids.contains(e.id))) {
+        final path = s.data;
+        if (path.isEmpty) continue;
+        final file = File(path);
+        if (await file.exists()) {
+          items.add({'file': file, 'filename': path.split('/').last, 'title': s.title, 'artist': s.artist});
+        }
+      }
+    }
+    if (items.isEmpty) {
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('没有可上传的文件')));
+      return;
+    }
+    await _runBatchUploadDialog(items, ep);
+  }
+
+  Future<void> _runBatchUploadDialog(List<Map<String, dynamic>> items, String endpoint) async {
+    int index = 0;
+    int success = 0;
+    int failed = 0;
+    final failedItems = <Map<String, dynamic>>[];
+    bool running = true;
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(builder: (ctx, setState) {
+          Future.microtask(() async {
+            if (!running) return;
+            for (; index < items.length; index++) {
+              final it = items[index];
+              final file = it['file'] as File;
+              final filename = it['filename'] as String;
+              final title = it['title'] as String?;
+              final artist = it['artist'] as String?;
+              final ok = await _uploadFileCore(file, endpoint: endpoint, filename: filename, title: title, artist: artist);
+              if (ok) {
+                success++;
+              } else {
+                failed++;
+                failedItems.add(it);
+              }
+              if (!mounted) break;
+              setState(() {});
+            }
+            running = false;
+          });
+          final total = items.length;
+          final current = index < total ? (items[index]['filename'] as String) : '';
+          final done = !running && index >= total;
+          return AlertDialog(
+            title: const Text('上传进度'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('总数：$total'),
+                Text('成功：$success'),
+                Text('失败：$failed'),
+                const SizedBox(height: 8),
+                if (!done) ...[
+                  const LinearProgressIndicator(),
+                  const SizedBox(height: 6),
+                  Text('当前：$current'),
+                ] else ...[
+                  const SizedBox(height: 8),
+                  const Text('已完成'),
+                ],
+              ],
+            ),
+            actions: [
+              if (done && failedItems.isNotEmpty)
+                TextButton(
+                  onPressed: () async {
+                    Navigator.pop(ctx);
+                    await _runBatchUploadDialog(failedItems, endpoint);
+                  },
+                  child: const Text('重试失败项'),
+                ),
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                },
+                child: Text(done ? '关闭' : '后台进行'),
+              ),
+            ],
+          );
+        });
+      },
+    );
+  }
+
+  Future<Directory> _ensureLibraryDir() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/library');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
+  }
+
+  Future<File> _copyToLibrary(File src) async {
+    final dir = await _ensureLibraryDir();
+    final name = _safeName(src.path.split('/').last);
+    final dst = File('${dir.path}/$name');
+    if (await dst.exists()) {
+      // Append timestamp to avoid collision
+      final ts = DateTime.now().millisecondsSinceEpoch;
+      final parts = name.split('.');
+      final base = parts.length > 1 ? parts.sublist(0, parts.length - 1).join('.') : name;
+      final ext = parts.length > 1 ? '.${parts.last}' : '';
+      final newName = '${base}_$ts$ext';
+      final newDst = File('${dir.path}/$newName');
+      return src.copy(newDst.path);
+    }
+    return src.copy(dst.path);
+  }
+
+  Future<void> _batchSaveSelectedToLocal() async {
+    final items = <Map<String, dynamic>>[];
+    if (Platform.isIOS) {
+      final keys = _selected.toSet();
+      for (final it in _picked.where((e) => keys.contains(e.uri.toString()))) {
+        if (it.uri.scheme != 'file') continue;
+        final file = File(it.uri.toFilePath());
+        if (await file.exists()) {
+          items.add({'file': file, 'title': it.title, 'artist': it.artist, 'durationMs': it.duration?.inMilliseconds});
+        }
+      }
+    } else {
+      final ids = _selected.map((k) => int.tryParse(k)).whereType<int>().toSet();
+      for (final s in _songs.where((e) => ids.contains(e.id))) {
+        final path = s.data;
+        if (path.isEmpty) continue;
+        final file = File(path);
+        if (await file.exists()) {
+          items.add({'file': file, 'title': s.title, 'artist': s.artist, 'durationMs': s.duration});
+        }
+      }
+    }
+    if (items.isEmpty) {
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('没有可保存的文件')));
+      return;
+    }
+    int index = 0;
+    int success = 0;
+    int failed = 0;
+    final saved = <PlaylistItem>[];
+    bool running = true;
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(builder: (ctx, setState) {
+          Future.microtask(() async {
+            if (!running) return;
+            for (; index < items.length; index++) {
+              final it = items[index];
+              final file = it['file'] as File;
+              try {
+                final dst = await _copyToLibrary(file);
+                saved.add(PlaylistItem(
+                  uri: dst.uri.toString(),
+                  title: it['title'] as String,
+                  artist: it['artist'] as String?,
+                  durationMs: (it['durationMs'] as int?),
+                ));
+                success++;
+              } catch (_) {
+                failed++;
+              }
+              if (!mounted) break;
+              setState(() {});
+            }
+            running = false;
+          });
+          final total = items.length;
+          final current = index < total ? ((items[index]['file'] as File).path.split('/').last) : '';
+          final done = !running && index >= total;
+          return AlertDialog(
+            title: const Text('保存到本地库'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('总数：$total'),
+                Text('成功：$success'),
+                Text('失败：$failed'),
+                const SizedBox(height: 8),
+                if (!done) ...[
+                  const LinearProgressIndicator(),
+                  const SizedBox(height: 6),
+                  Text('当前：$current'),
+                ] else ...[
+                  const SizedBox(height: 8),
+                  const Text('已完成'),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: Text(done ? '关闭' : '后台进行'),
+              ),
+            ],
+          );
+        });
+      },
+    );
+    if (saved.isNotEmpty) {
+      final store = context.read<PlaylistStore>();
+      await store.addOrCreate('本地库', saved);
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('已保存至“本地库”歌单')));
+    }
+  }
+
+  Future<void> _handleUploadTap() async {
+    await _pickAndSaveToLocal();
+  }
+
+  Future<void> _pickAndSaveToLocal() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      type: FileType.custom,
+      allowedExtensions: ['mp3', 'aac', 'm4a', 'wav', 'flac', 'ogg'],
+    );
+    if (result == null) return;
+    final files = result.files.where((f) => f.path != null).toList();
+    if (files.isEmpty) {
+      if (!mounted) return;
+      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('未选择任何文件')));
+      return;
+    }
+    int success = 0;
+    int failed = 0;
+    final saved = <PlaylistItem>[];
+    for (final f in files) {
+      try {
+        final src = File(f.path!);
+        if (!await src.exists()) {
+          failed++;
+          continue;
+        }
+        final dst = await _copyToLibrary(src);
+        String title = f.name;
+        String? artist;
+        int? durationMs;
+        try {
+          final meta = await MetadataGod.readMetadata(file: dst.path);
+          if (meta.title != null && meta.title!.isNotEmpty) title = meta.title!;
+          artist = meta.artist;
+          if (meta.durationMs != null) {
+            final ms = meta.durationMs!;
+            durationMs = ms is int ? ms as int : (ms as num).round();
+          }
+        } catch (_) {}
+        saved.add(PlaylistItem(uri: dst.uri.toString(), title: title, artist: artist, durationMs: durationMs));
+        success++;
+      } catch (_) {
+        failed++;
+      }
+    }
+    if (saved.isNotEmpty) {
+      final store = context.read<PlaylistStore>();
+      await store.addOrCreate('本地库', saved);
+    }
+    if (!mounted) return;
+    final msg = '成功：$success，失败：$failed';
+    showDialog(context: context, builder: (_) => AlertDialog(content: Text('上传完成（$msg）')));
+  }
 }
 
 enum _SortMode { titleAsc, titleDesc, artistAsc, artistDesc, durationAsc, durationDesc }
@@ -1015,13 +1491,23 @@ class MiniPlayer extends StatelessWidget {
                           onPressed: () => player.cyclePlayMode(),
                           icon: Icon(_modeIcon(player.mode)),
                         ),
-                        _ArtworkThumb(item: item),
+                        GestureDetector(
+                          onTap: () {
+                            FullPlayerPage.open(context);
+                          },
+                          child: _ArtworkThumb(item: item),
+                        ),
                         const SizedBox(width: 12),
                         Expanded(
-                          child: Text(
-                            item?.title ?? '未播放',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                          child: GestureDetector(
+                            onTap: () {
+                              FullPlayerPage.open(context);
+                            },
+                            child: Text(
+                              item?.title ?? '未播放',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                         ),
                         IconButton(

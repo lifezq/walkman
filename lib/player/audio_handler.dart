@@ -10,6 +10,7 @@ import 'play_mode.dart';
 
 class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final AudioPlayer _player = AudioPlayer();
+  ConcatenatingAudioSource? _concat;
   StreamSubscription<PlaybackEvent>? _eventSub;
   StreamSubscription<int?>? _indexSub;
 
@@ -67,7 +68,8 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
           },
         )
         .toList();
-    await _player.setAudioSource(ConcatenatingAudioSource(children: children), initialIndex: startIndex);
+    _concat = ConcatenatingAudioSource(children: children);
+    await _player.setAudioSource(_concat!, initialIndex: startIndex);
   }
 
   Future<void> setQueueFromUris(List<Uri> uris, {List<String>? titles, int startIndex = 0}) async {
@@ -104,7 +106,8 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
       children.add(AudioSource.uri(uri, tag: item));
     }
     queue.add(items);
-    await _player.setAudioSource(ConcatenatingAudioSource(children: children), initialIndex: startIndex);
+    _concat = ConcatenatingAudioSource(children: children);
+    await _player.setAudioSource(_concat!, initialIndex: startIndex);
   }
 
   @override
@@ -129,7 +132,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     switch (mode) {
       case PlayMode.sequence:
         await _player.setShuffleModeEnabled(false);
-        await _player.setLoopMode(LoopMode.off);
+        await _player.setLoopMode(LoopMode.all);
         break;
       case PlayMode.shuffle:
         await _player.setShuffleModeEnabled(true);
@@ -140,6 +143,32 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         await _player.setLoopMode(LoopMode.one);
         break;
     }
+  }
+
+  @override
+  Future<void> skipToQueueItem(int index) async {
+    await _player.seek(Duration.zero, index: index);
+  }
+
+  Future<void> reorderQueue(int oldIndex, int newIndex) async {
+    if (_concat == null) return;
+    final items = List<MediaItem>.from(queue.value);
+    if (newIndex > oldIndex) newIndex -= 1;
+    if (oldIndex < 0 || oldIndex >= items.length) return;
+    if (newIndex < 0 || newIndex >= items.length) return;
+    final item = items.removeAt(oldIndex);
+    items.insert(newIndex, item);
+    await _concat!.move(oldIndex, newIndex);
+    queue.add(items);
+  }
+
+  Future<void> removeFromQueue(int index) async {
+    if (_concat == null) return;
+    final items = List<MediaItem>.from(queue.value);
+    if (index < 0 || index >= items.length) return;
+    items.removeAt(index);
+    await _concat!.removeAt(index);
+    queue.add(items);
   }
 
   void _broadcastState(PlaybackEvent event) {

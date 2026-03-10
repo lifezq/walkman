@@ -60,6 +60,14 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> reorderQueue(int oldIndex, int newIndex) async {
+    await _handler.reorderQueue(oldIndex, newIndex);
+  }
+
+  Future<void> removeQueueIndex(int index) async {
+    await _handler.removeFromQueue(index);
+  }
+
   Future<void> cyclePlayMode() async {
     switch (_mode) {
       case PlayMode.sequence:
