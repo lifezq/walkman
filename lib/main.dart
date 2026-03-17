@@ -12,7 +12,6 @@ import 'package:metadata_god/metadata_god.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
 import 'package:open_filex/open_filex.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 import 'player/player_controller.dart';
 import 'player/audio_handler.dart';
@@ -617,7 +616,14 @@ class _HomePageState extends State<HomePage> {
         actions: [
           IconButton(
             onPressed: () {
-              Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SettingsPage()));
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => SettingsPage(
+                    onScanLocalMusic: Platform.isAndroid ? _scanAndroid : null,
+                    onUpload: _handleUploadTap,
+                  ),
+                ),
+              );
             },
             icon: const Icon(Icons.settings),
             tooltip: '设置',
@@ -642,65 +648,27 @@ class _HomePageState extends State<HomePage> {
                     onPressed: _scanDirectory,
                     child: const Text('扫描文件夹'),
                   ),
-                if (!isIOS)
-                  OutlinedButton(
-                    onPressed: _scanAndroid,
-                    child: const Text('扫描本地音乐'),
-                  ),
-                FilledButton(
-                  onPressed: (isIOS ? _picked.isEmpty : _songs.isEmpty)
-                      ? null
-                      : () {
-                            _ensureNotificationPermission();
-                          if (isIOS) {
-                            final uris = _picked.map((e) => e.uri).toList();
-                            final titles = _picked.map((e) => e.title).toList();
-                            player.setPlaylistFromUris(uris, titles: titles);
-                          } else {
-                            player.setPlaylist(_songs);
-                          }
-                          player.play();
-                        },
-                  child: const Text('播放'),
-                ),
-                FilledButton.tonal(
-                  onPressed: player.pause,
-                  child: const Text('暂停'),
-                ),
-                OutlinedButton(
-                  onPressed: player.next,
-                  child: const Text('下一首'),
-                ),
-                OutlinedButton(
-                  onPressed: player.previous,
-                  child: const Text('上一首'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    _handleUploadTap();
-                  },
-                  child: const Text('上传'),
-                ),
               ],
             ),
             const SizedBox(height: 12),
+            TextField(
+              decoration: const InputDecoration(
+                prefixIcon: Icon(Icons.search),
+                hintText: '搜索标题或歌手',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              onChanged: (v) => setState(() => _query = v),
+            ),
+            const SizedBox(height: 8),
             Row(
               children: [
-                Expanded(
-                  child: TextField(
-                    decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.search),
-                      hintText: '搜索标题或歌手',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                    onChanged: (v) => setState(() => _query = v),
-                  ),
-                ),
-                const SizedBox(width: 8),
+                const Text('排序：', style: TextStyle(fontSize: 14)),
+                const SizedBox(width: 4),
                 DropdownButton<_SortMode>(
                   value: _sortMode,
                   onChanged: (m) => setState(() => _sortMode = m!),
+                  underline: const SizedBox(),
                   items: const [
                     DropdownMenuItem(value: _SortMode.titleAsc, child: Text('标题 ↑')),
                     DropdownMenuItem(value: _SortMode.titleDesc, child: Text('标题 ↓')),
@@ -710,7 +678,7 @@ class _HomePageState extends State<HomePage> {
                     DropdownMenuItem(value: _SortMode.durationDesc, child: Text('时长 ↓')),
                   ],
                 ),
-                const SizedBox(width: 8),
+                const Spacer(),
                 FilterChip(
                   label: const Text('只看喜欢'),
                   selected: _onlyLiked,
@@ -1077,16 +1045,6 @@ class _HomePageState extends State<HomePage> {
       _picked = list;
     });
     await _saveImportedList();
-  }
-
-  Future<void> _ensureNotificationPermission() async {
-    if (!Platform.isAndroid) return;
-    try {
-      final status = await Permission.notification.status;
-      if (!status.isGranted) {
-        await Permission.notification.request();
-      }
-    } catch (_) {}
   }
 
   Future<void> _saveAndroidSongToLocal(SongModel s) async {
