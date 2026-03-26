@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:provider/provider.dart';
@@ -22,9 +23,54 @@ import 'player/full_player_page.dart';
 import 'settings/settings_store.dart';
 import 'settings/settings_page.dart';
 
+const MethodChannel _deviceInfoChannel = MethodChannel('walkman/device_info');
+bool _metadataGodAvailable = false;
+
+Future<List<String>> _getAndroidSupportedAbis() async {
+  if (!Platform.isAndroid) return const <String>[];
+  try {
+    return await _deviceInfoChannel.invokeListMethod<String>('getSupportedAbis') ?? const <String>[];
+  } catch (_) {
+    return const <String>[];
+  }
+}
+
+bool _hasSupportedMetadataGodAbi(List<String> abis) {
+  if (abis.isEmpty) return true;
+  return abis.any((abi) => abi.contains('arm64') || abi.contains('armeabi'));
+}
+
+Future<bool> _tryInitializeMetadataGod() async {
+  if (Platform.isAndroid) {
+    final abis = await _getAndroidSupportedAbis();
+    if (!_hasSupportedMetadataGodAbi(abis)) {
+      debugPrint('MetadataGod disabled on unsupported ABI: $abis');
+      return false;
+    }
+  }
+  try {
+    await MetadataGod.initialize();
+    return true;
+  } catch (e) {
+    debugPrint('MetadataGod init skipped: $e');
+    return false;
+  }
+}
+
+Future<dynamic> _readMetadataSafe(String filePath) async {
+  if (!_metadataGodAvailable) return null;
+  try {
+    return await MetadataGod.readMetadata(file: filePath);
+  } catch (e) {
+    debugPrint('MetadataGod read failed, disabling metadata: $e');
+    _metadataGodAvailable = false;
+    return null;
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await MetadataGod.initialize();
+  _metadataGodAvailable = await _tryInitializeMetadataGod();
   try {
     await JustAudioBackground.init(
       androidNotificationChannelId: 'com.lifezq.walkman.channel.audio',
@@ -146,6 +192,7 @@ class _HomePageState extends State<HomePage> {
     final prefs = await SharedPreferences.getInstance();
     final likes = prefs.getStringList('likes')?.toSet() ?? <String>{};
     final favorites = prefs.getStringList('favorites')?.toSet() ?? <String>{};
+    if (!mounted) return;
     final controller = context.read<PlayerController>();
     controller.loadStates(likes, favorites);
     await controller.initPlayMode();
@@ -170,18 +217,21 @@ class _HomePageState extends State<HomePage> {
       String? artist;
       Duration? duration;
       try {
-        final meta = await MetadataGod.readMetadata(file: f.path!);
-        artist = meta.artist;
-        if (meta.durationMs != null) {
-          final ms = meta.durationMs!;
-          final int intMs = ms is int ? ms as int : (ms as num).round();
-          duration = Duration(milliseconds: intMs);
+        final meta = await _readMetadataSafe(f.path!);
+        if (meta != null) {
+          artist = meta.artist;
+          if (meta.durationMs != null) {
+            final ms = meta.durationMs!;
+            final int intMs = ms is int ? ms : (ms as num).round();
+            duration = Duration(milliseconds: intMs);
+          }
+          if (meta.picture != null && meta.picture!.data.isNotEmpty) {
+            final file = File('${temp.path}/art_${_safeName(f.path!)}.jpg');
+            await file.writeAsBytes(meta.picture!.data);
+            artUri = file.uri;
+          }
         }
-        if (meta.picture != null && meta.picture!.data.isNotEmpty) {
-          final file = File('${temp.path}/art_${_safeName(f.path!)}.jpg');
-          await file.writeAsBytes(meta.picture!.data);
-          artUri = file.uri;
-        } else {
+        if (artUri == null) {
           final url = await _searchArtworkUrl(f.name, artist);
           if (url != null) {
             final bytes = await _download(url);
@@ -414,6 +464,7 @@ class _HomePageState extends State<HomePage> {
     final ordered = [...recent, ...other];
     final selected = <String>{...recent};
     final controller = TextEditingController();
+    if (!context.mounted) return <String>[];
     return showDialog<List<String>>(
       context: context,
       builder: (_) => StatefulBuilder(
@@ -610,6 +661,8 @@ class _HomePageState extends State<HomePage> {
           }).toList()
         : <SongModel>[];
     _applySort(iosList, androidList);
+    final List<_FolderSongsGroup> androidFolderGroups =
+        !isIOS ? _groupSongsByFolder(androidList) : const <_FolderSongsGroup>[];
     return Scaffold(
       appBar: AppBar(
         title: const Text('Walkman'),
@@ -728,6 +781,14 @@ class _HomePageState extends State<HomePage> {
                       onPressed: () => _addToPlaylist(context),
                       child: const Text('添加到歌单'),
                     ),
+                    OutlinedButton(
+                      onPressed: _batchSaveSelectedToLocal,
+                      child: const Text('保存选中'),
+                    ),
+                    OutlinedButton(
+                      onPressed: _batchUploadSelected,
+                      child: const Text('上传选中'),
+                    ),
                     FilledButton(
                       onPressed: () => _playSelection(player),
                       child: const Text('播放所选'),
@@ -765,7 +826,7 @@ class _HomePageState extends State<HomePage> {
             else
               Expanded(
                 child: ListView.separated(
-                  itemCount: isIOS ? iosList.length : androidList.length,
+                  itemCount: isIOS ? iosList.length : androidFolderGroups.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
                   itemBuilder: (context, index) {
                     if (isIOS) {
@@ -780,7 +841,7 @@ class _HomePageState extends State<HomePage> {
                             final titles = iosList.map((e) => e.title).toList();
                             await player.setPlaylistFromUris(uris, titles: titles, startIndex: index);
                             await player.play();
-                            if (!mounted) return;
+                            if (!context.mounted) return;
                             FullPlayerPage.open(context);
                           },
                           child: _leadingArtForPicked(item),
@@ -837,79 +898,28 @@ class _HomePageState extends State<HomePage> {
                         ),
                       );
                     } else {
-                      final s = androidList[index];
-                      final liked = player.isLiked(s.id);
-                      final favorite = player.isFavorite(s.id);
-                      final key = s.id.toString();
+                      final group = androidFolderGroups[index];
                       return ListTile(
-                        leading: GestureDetector(
-                          onTap: () async {
-                            await player.setPlaylist(androidList, startIndex: index);
-                            await player.play();
-                            if (!mounted) return;
-                            FullPlayerPage.open(context);
-                          },
-                          child: QueryArtworkWidget(
-                            id: s.id,
-                            type: ArtworkType.AUDIO,
-                            nullArtworkWidget: const _PlaceholderArt(),
-                          ),
-                        ),
-                        selected: _selected.contains(key),
-                        onLongPress: () => _toggleSelectKey(key),
+                        leading: const Icon(Icons.folder),
+                        title: Text(group.name),
+                        subtitle: Text('${group.songs.length} 首歌曲'),
+                        trailing: const Icon(Icons.chevron_right),
                         onTap: () {
-                          if (_selected.isNotEmpty) {
-                            _toggleSelectKey(key);
-                          } else {
-                            player.setPlaylist(androidList, startIndex: index);
-                            player.play();
-                          }
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => _AndroidFolderSongsPage(
+                                folderPath: group.path,
+                                songs: group.songs,
+                                onAddSingleSongToPlaylist: _addSingleSongToPlaylist,
+                                onShowSongDetail: _showSongDetail,
+                                onOpenAndroidSong: _openAndroidSong,
+                                onLocateInPlaylistByUri: _locateInPlaylistByUri,
+                                onRemoveFromPlaylistsByUri: _removeFromPlaylistsByUri,
+                                onSaveAndroidSongToLocal: _saveAndroidSongToLocal,
+                              ),
+                            ),
+                          );
                         },
-                        title: Text(s.title),
-                        subtitle: Text([
-                          s.artist ?? '未知',
-                          if ((s.duration ?? 0) > 0)
-                            _fmt(Duration(milliseconds: s.duration!))
-                        ].join(' · ')),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              onPressed: () => player.toggleLike(s.id),
-                              icon: Icon(
-                                liked ? Icons.favorite : Icons.favorite_border,
-                                color: liked ? Colors.red : null,
-                              ),
-                            ),
-                            IconButton(
-                              onPressed: () => player.toggleFavorite(s.id),
-                              icon: Icon(
-                                favorite ? Icons.bookmark : Icons.bookmark_border,
-                              ),
-                            ),
-                            IconButton(
-                              tooltip: '添加到歌单',
-                              onPressed: () => _addSingleSongToPlaylist(context, s),
-                              icon: const Icon(Icons.playlist_add),
-                            ),
-                            PopupMenuButton<String>(
-                              onSelected: (v) {
-                                if (v == 'detail') _showSongDetail(context, s);
-                            if (v == 'open') _openAndroidSong(s);
-                            if (v == 'locate') _locateInPlaylistByUri(s.uri ?? '');
-                            if (v == 'remove_from_playlist') _removeFromPlaylistsByUri(s.uri ?? '');
-                            if (v == 'save_local') _saveAndroidSongToLocal(s);
-                              },
-                          itemBuilder: (context) => const [
-                            PopupMenuItem(value: 'detail', child: Text('查看详情')),
-                            PopupMenuItem(value: 'open', child: Text('打开文件')),
-                            PopupMenuItem(value: 'locate', child: Text('定位到歌单位置')),
-                            PopupMenuItem(value: 'remove_from_playlist', child: Text('从歌单移除…')),
-                            PopupMenuItem(value: 'save_local', child: Text('保存到本地库')),
-                          ],
-                            ),
-                          ],
-                        ),
                       );
                     }
                   },
@@ -919,6 +929,32 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+  }
+
+  List<_FolderSongsGroup> _groupSongsByFolder(List<SongModel> songs) {
+    final byFolder = <String, List<SongModel>>{};
+    for (final song in songs) {
+      final folderPath = _folderPathOfSong(song);
+      byFolder.putIfAbsent(folderPath, () => <SongModel>[]).add(song);
+    }
+    final groups = byFolder.entries
+        .map((e) => _FolderSongsGroup(
+              path: e.key,
+              name: _folderNameFromPath(e.key),
+              songs: e.value,
+            ))
+        .toList();
+    groups.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return groups;
+  }
+
+  String _folderPathOfSong(SongModel song) {
+    final raw = song.data;
+    if (raw.isEmpty) return 'Unknown folder';
+    final normalized = raw.replaceAll('\\', '/');
+    final idx = normalized.lastIndexOf('/');
+    if (idx <= 0) return normalized;
+    return normalized.substring(0, idx);
   }
 
   void _applySort(List<_PickedAudio> iosList, List<SongModel> androidList) {
@@ -1019,21 +1055,23 @@ class _HomePageState extends State<HomePage> {
           final name = ent.uri.pathSegments.isNotEmpty ? ent.uri.pathSegments.last : ent.path;
           final lower = name.toLowerCase();
           if (!exts.any((e) => lower.endsWith(e))) continue;
-          Uri? artUri;
-          String? artist;
+      Uri? artUri;
+      String? artist;
           Duration? duration;
           try {
-            final meta = await MetadataGod.readMetadata(file: ent.path);
-            artist = meta.artist;
-            if (meta.durationMs != null) {
-              final ms = meta.durationMs!;
-              final int intMs = ms is int ? ms as int : (ms as num).round();
-              duration = Duration(milliseconds: intMs);
-            }
-            if (meta.picture != null && meta.picture!.data.isNotEmpty) {
-              final file = File('${temp.path}/art_${_safeName(ent.path)}.jpg');
-              await file.writeAsBytes(meta.picture!.data);
-              artUri = file.uri;
+            final meta = await _readMetadataSafe(ent.path);
+            if (meta != null) {
+              artist = meta.artist;
+              if (meta.durationMs != null) {
+                final ms = meta.durationMs!;
+                final int intMs = ms is int ? ms : (ms as num).round();
+                duration = Duration(milliseconds: intMs);
+              }
+              if (meta.picture != null && meta.picture!.data.isNotEmpty) {
+                final file = File('${temp.path}/art_${_safeName(ent.path)}.jpg');
+                await file.writeAsBytes(meta.picture!.data);
+                artUri = file.uri;
+              }
             }
           } catch (_) {}
           list.add(_PickedAudio(uri: ent.uri, title: name, artUri: artUri, artist: artist, duration: duration));
@@ -1048,6 +1086,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _saveAndroidSongToLocal(SongModel s) async {
+    final playlistStore = context.read<PlaylistStore>();
     final path = s.data;
     if (path.isEmpty) return;
     final file = File(path);
@@ -1060,34 +1099,13 @@ class _HomePageState extends State<HomePage> {
         artist: s.artist,
         durationMs: s.duration,
       );
-      await context.read<PlaylistStore>().addOrCreate('本地库', [item]);
+      await playlistStore.addOrCreate('本地库', [item]);
       if (!mounted) return;
       showDialog(context: context, builder: (_) => const AlertDialog(content: Text('已保存至“本地库”歌单')));
     } catch (_) {
       if (!mounted) return;
       showDialog(context: context, builder: (_) => const AlertDialog(content: Text('保存失败')));
     }
-  }
-
-  Future<void> _uploadPicked(_PickedAudio item) async {
-    if (item.uri.scheme != 'file') return;
-    final file = File(item.uri.toFilePath());
-    if (!await file.exists()) return;
-    final name = file.path.split('/').last;
-    await _uploadFile(file, filename: name, title: item.title, artist: item.artist);
-  }
-
-  Future<void> _uploadFile(File file, {required String filename, String? title, String? artist}) async {
-    final store = context.read<SettingsStore>();
-    final ep = store.endpoint;
-    if (ep == null || ep.isEmpty) {
-      if (!mounted) return;
-      showDialog(context: context, builder: (_) => const AlertDialog(content: Text('请先在设置中配置上传服务器地址')));
-      return;
-    }
-    final ok = await _uploadFileCore(file, endpoint: ep, filename: filename, title: title, artist: artist);
-    if (!mounted) return;
-    showDialog(context: context, builder: (_) => AlertDialog(content: Text(ok ? '上传成功' : '上传失败')));
   }
 
   Future<bool> _uploadFileCore(File file, {required String endpoint, required String filename, String? title, String? artist}) async {
@@ -1244,6 +1262,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _batchSaveSelectedToLocal() async {
+    final playlistStore = context.read<PlaylistStore>();
     final items = <Map<String, dynamic>>[];
     if (Platform.isIOS) {
       final keys = _selected.toSet();
@@ -1275,6 +1294,7 @@ class _HomePageState extends State<HomePage> {
     int failed = 0;
     final saved = <PlaylistItem>[];
     bool running = true;
+    if (!mounted) return;
     await showDialog(
       context: context,
       barrierDismissible: false,
@@ -1336,8 +1356,7 @@ class _HomePageState extends State<HomePage> {
       },
     );
     if (saved.isNotEmpty) {
-      final store = context.read<PlaylistStore>();
-      await store.addOrCreate('本地库', saved);
+      await playlistStore.addOrCreate('本地库', saved);
       if (!mounted) return;
       showDialog(context: context, builder: (_) => const AlertDialog(content: Text('已保存至“本地库”歌单')));
     }
@@ -1348,6 +1367,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _pickAndSaveToLocal() async {
+    final playlistStore = context.read<PlaylistStore>();
     final result = await FilePicker.platform.pickFiles(
       allowMultiple: true,
       type: FileType.custom,
@@ -1375,12 +1395,14 @@ class _HomePageState extends State<HomePage> {
         String? artist;
         int? durationMs;
         try {
-          final meta = await MetadataGod.readMetadata(file: dst.path);
-          if (meta.title != null && meta.title!.isNotEmpty) title = meta.title!;
-          artist = meta.artist;
-          if (meta.durationMs != null) {
-            final ms = meta.durationMs!;
-            durationMs = ms is int ? ms as int : (ms as num).round();
+          final meta = await _readMetadataSafe(dst.path);
+          if (meta != null) {
+            if (meta.title != null && meta.title!.isNotEmpty) title = meta.title!;
+            artist = meta.artist;
+            if (meta.durationMs != null) {
+              final ms = meta.durationMs!;
+              durationMs = ms is int ? ms : (ms as num).round();
+            }
           }
         } catch (_) {}
         saved.add(PlaylistItem(uri: dst.uri.toString(), title: title, artist: artist, durationMs: durationMs));
@@ -1390,12 +1412,153 @@ class _HomePageState extends State<HomePage> {
       }
     }
     if (saved.isNotEmpty) {
-      final store = context.read<PlaylistStore>();
-      await store.addOrCreate('本地库', saved);
+      await playlistStore.addOrCreate('本地库', saved);
     }
     if (!mounted) return;
     final msg = '成功：$success，失败：$failed';
     showDialog(context: context, builder: (_) => AlertDialog(content: Text('上传完成（$msg）')));
+  }
+}
+
+String _folderNameFromPath(String path) {
+  final normalized = path.replaceAll('\\', '/');
+  final segments = normalized.split('/').where((e) => e.isNotEmpty).toList();
+  if (segments.isEmpty) return path;
+  return segments.last;
+}
+
+class _FolderSongsGroup {
+  final String path;
+  final String name;
+  final List<SongModel> songs;
+
+  const _FolderSongsGroup({
+    required this.path,
+    required this.name,
+    required this.songs,
+  });
+}
+
+class _AndroidFolderSongsPage extends StatelessWidget {
+  final String folderPath;
+  final List<SongModel> songs;
+  final Future<void> Function(BuildContext context, SongModel song) onAddSingleSongToPlaylist;
+  final void Function(BuildContext context, SongModel song) onShowSongDetail;
+  final Future<void> Function(SongModel song) onOpenAndroidSong;
+  final Future<void> Function(String uri) onLocateInPlaylistByUri;
+  final Future<void> Function(String uri) onRemoveFromPlaylistsByUri;
+  final Future<void> Function(SongModel song) onSaveAndroidSongToLocal;
+
+  const _AndroidFolderSongsPage({
+    required this.folderPath,
+    required this.songs,
+    required this.onAddSingleSongToPlaylist,
+    required this.onShowSongDetail,
+    required this.onOpenAndroidSong,
+    required this.onLocateInPlaylistByUri,
+    required this.onRemoveFromPlaylistsByUri,
+    required this.onSaveAndroidSongToLocal,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final player = context.watch<PlayerController>();
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_folderNameFromPath(folderPath)),
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                folderPath,
+                style: Theme.of(context).textTheme.bodySmall,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: ListView.separated(
+              itemCount: songs.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final s = songs[index];
+                final liked = player.isLiked(s.id);
+                final favorite = player.isFavorite(s.id);
+                return ListTile(
+                  leading: GestureDetector(
+                    onTap: () async {
+                      await player.setPlaylist(songs, startIndex: index);
+                      await player.play();
+                      if (!context.mounted) return;
+                      FullPlayerPage.open(context);
+                    },
+                    child: QueryArtworkWidget(
+                      id: s.id,
+                      type: ArtworkType.AUDIO,
+                      nullArtworkWidget: const _PlaceholderArt(),
+                    ),
+                  ),
+                  onTap: () {
+                    player.setPlaylist(songs, startIndex: index);
+                    player.play();
+                  },
+                  title: Text(s.title),
+                  subtitle: Text([
+                    s.artist ?? '未知',
+                    if ((s.duration ?? 0) > 0) _fmt(Duration(milliseconds: s.duration!)),
+                  ].join(' · ')),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        onPressed: () => player.toggleLike(s.id),
+                        icon: Icon(
+                          liked ? Icons.favorite : Icons.favorite_border,
+                          color: liked ? Colors.red : null,
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () => player.toggleFavorite(s.id),
+                        icon: Icon(
+                          favorite ? Icons.bookmark : Icons.bookmark_border,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: '添加到歌单',
+                        onPressed: () => onAddSingleSongToPlaylist(context, s),
+                        icon: const Icon(Icons.playlist_add),
+                      ),
+                      PopupMenuButton<String>(
+                        onSelected: (v) {
+                          if (v == 'detail') onShowSongDetail(context, s);
+                          if (v == 'open') onOpenAndroidSong(s);
+                          if (v == 'locate') onLocateInPlaylistByUri(s.uri ?? '');
+                          if (v == 'remove_from_playlist') onRemoveFromPlaylistsByUri(s.uri ?? '');
+                          if (v == 'save_local') onSaveAndroidSongToLocal(s);
+                        },
+                        itemBuilder: (context) => const [
+                          PopupMenuItem(value: 'detail', child: Text('查看详情')),
+                          PopupMenuItem(value: 'open', child: Text('打开文件')),
+                          PopupMenuItem(value: 'locate', child: Text('定位到歌单位置')),
+                          PopupMenuItem(value: 'remove_from_playlist', child: Text('从歌单移除…')),
+                          PopupMenuItem(value: 'save_local', child: Text('保存到本地库')),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
