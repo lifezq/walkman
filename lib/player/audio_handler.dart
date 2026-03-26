@@ -17,9 +17,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   MyAudioHandler() {
     _eventSub = _player.playbackEventStream.listen(_broadcastState);
     _indexSub = _player.currentIndexStream.listen((index) {
-      if (index != null && index >= 0 && index < queue.value.length) {
-        mediaItem.add(queue.value[index]);
-      }
+      _syncMediaItemWithCurrentQueue(index: index);
     });
   }
 
@@ -70,6 +68,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
         .toList();
     _concat = ConcatenatingAudioSource(children: children);
     await _player.setAudioSource(_concat!, initialIndex: startIndex);
+    _syncMediaItemWithCurrentQueue(index: startIndex);
   }
 
   Future<void> setQueueFromUris(List<Uri> uris, {List<String>? titles, int startIndex = 0}) async {
@@ -108,6 +107,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     queue.add(items);
     _concat = ConcatenatingAudioSource(children: children);
     await _player.setAudioSource(_concat!, initialIndex: startIndex);
+    _syncMediaItemWithCurrentQueue(index: startIndex);
   }
 
   @override
@@ -160,6 +160,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     items.insert(newIndex, item);
     await _concat!.move(oldIndex, newIndex);
     queue.add(items);
+    _syncMediaItemWithCurrentQueue();
   }
 
   Future<void> removeFromQueue(int index) async {
@@ -169,6 +170,19 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     items.removeAt(index);
     await _concat!.removeAt(index);
     queue.add(items);
+    _syncMediaItemWithCurrentQueue();
+  }
+
+  void _syncMediaItemWithCurrentQueue({int? index}) {
+    final items = queue.value;
+    final i = index ?? _player.currentIndex;
+    if (i != null && i >= 0 && i < items.length) {
+      mediaItem.add(items[i]);
+      return;
+    }
+    if (items.isEmpty) {
+      mediaItem.add(null);
+    }
   }
 
   void _broadcastState(PlaybackEvent event) {

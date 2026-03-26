@@ -28,7 +28,7 @@ class FullPlayerPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final handler = context.watch<AudioHandler>();
-    final controller = context.watch<PlayerController>();
+    final controller = context.read<PlayerController>();
     return StreamBuilder<MediaItem?>(
       stream: handler.mediaItem,
       builder: (context, snapItem) {
@@ -100,7 +100,7 @@ class FullPlayerPage extends StatelessWidget {
                             Row(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                _LikeFavoriteBar(item: item, controller: controller),
+                                _LikeFavoriteBar(item: item),
                               ],
                             ),
                           ],
@@ -117,8 +117,12 @@ class FullPlayerPage extends StatelessWidget {
                               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                               children: [
                                 IconButton(
-                                  icon: Icon(controller.mode == PlayMode.shuffle ? Icons.shuffle_on : Icons.shuffle),
+                                  tooltip: '播放模式',
                                   onPressed: () => controller.cyclePlayMode(),
+                                  icon: Selector<PlayerController, PlayMode>(
+                                    selector: (_, c) => c.mode,
+                                    builder: (_, mode, __) => Icon(_modeIcon(mode)),
+                                  ),
                                 ),
                                 IconButton(
                                   iconSize: 36,
@@ -235,11 +239,11 @@ class _MainArtwork extends StatelessWidget {
 
 class _LikeFavoriteBar extends StatelessWidget {
   final MediaItem? item;
-  final PlayerController controller;
-  const _LikeFavoriteBar({required this.item, required this.controller});
+  const _LikeFavoriteBar({required this.item});
 
   @override
   Widget build(BuildContext context) {
+    final controller = context.watch<PlayerController>();
     final ids = _ids();
     final liked = ids.$1 != null ? controller.isLiked(ids.$1!) : (ids.$2 != null ? controller.isLikedKey(ids.$2!) : false);
     final favorite = ids.$1 != null ? controller.isFavorite(ids.$1!) : (ids.$2 != null ? controller.isFavoriteKey(ids.$2!) : false);
@@ -335,14 +339,25 @@ String _fmt(Duration d) {
   return '$m:$s';
 }
 
+IconData _modeIcon(PlayMode m) {
+  switch (m) {
+    case PlayMode.sequence:
+      return Icons.repeat;
+    case PlayMode.shuffle:
+      return Icons.shuffle;
+    case PlayMode.single:
+      return Icons.repeat_one;
+  }
+}
+
 void _openQueue(BuildContext context, AudioHandler handler) {
+  final selectedIds = <String>{};
   showModalBottomSheet(
     context: context,
     isScrollControlled: true,
     builder: (ctx) {
       return StatefulBuilder(
         builder: (context, setState) {
-          final selected = <int>{};
           return SafeArea(
             child: StreamBuilder<List<MediaItem>>(
               stream: handler.queue,
@@ -351,7 +366,9 @@ void _openQueue(BuildContext context, AudioHandler handler) {
                 if (items.isEmpty) {
                   return const SizedBox(height: 200, child: Center(child: Text('播放队列为空')));
                 }
+                selectedIds.removeWhere((id) => !items.any((it) => it.id == id));
                 final controller = context.read<PlayerController>();
+                final allSelected = selectedIds.length == items.length;
                 return SizedBox(
                   height: MediaQuery.of(context).size.height * 0.7,
                   child: Column(
@@ -362,34 +379,38 @@ void _openQueue(BuildContext context, AudioHandler handler) {
                           children: [
                             const Text('播放队列'),
                             const Spacer(),
-                            if (selected.isNotEmpty)
+                            if (selectedIds.isNotEmpty)
                               TextButton(
                                 onPressed: () async {
-                                  final idxs = selected.toList()..sort((a, b) => b.compareTo(a));
+                                  final idxs = <int>[];
+                                  for (var i = 0; i < items.length; i++) {
+                                    if (selectedIds.contains(items[i].id)) idxs.add(i);
+                                  }
+                                  idxs.sort((a, b) => b.compareTo(a));
                                   for (final i in idxs) {
                                     await controller.removeQueueIndex(i);
                                   }
                                   setState(() {
-                                    selected.clear();
+                                    selectedIds.clear();
                                   });
                                 },
                                 child: const Text('删除所选'),
                               ),
                             TextButton(
                               onPressed: () {
-                                if (selected.length == items.length) {
+                                if (allSelected) {
                                   setState(() {
-                                    selected.clear();
+                                    selectedIds.clear();
                                   });
                                 } else {
                                   setState(() {
-                                    selected
+                                    selectedIds
                                       ..clear()
-                                      ..addAll(List<int>.generate(items.length, (i) => i));
+                                      ..addAll(items.map((e) => e.id));
                                   });
                                 }
                               },
-                              child: Text(selected.length == items.length ? '清空' : '全选'),
+                              child: Text(allSelected ? '清空' : '全选'),
                             ),
                           ],
                         ),
@@ -403,7 +424,7 @@ void _openQueue(BuildContext context, AudioHandler handler) {
                           },
                           itemBuilder: (context, index) {
                             final it = items[index];
-                            final isSel = selected.contains(index);
+                            final isSel = selectedIds.contains(it.id);
                             return ListTile(
                               key: ValueKey(it.id),
                               leading: Checkbox(
@@ -411,22 +432,40 @@ void _openQueue(BuildContext context, AudioHandler handler) {
                                 onChanged: (v) {
                                   setState(() {
                                     if (v == true) {
-                                      selected.add(index);
+                                      selectedIds.add(it.id);
                                     } else {
-                                      selected.remove(index);
+                                      selectedIds.remove(it.id);
                                     }
                                   });
                                 },
                               ),
                               title: Text(it.title, maxLines: 1, overflow: TextOverflow.ellipsis),
                               subtitle: Text(it.artist ?? '', maxLines: 1, overflow: TextOverflow.ellipsis),
-                              onTap: () async {
-                                await handler.skipToQueueItem(index);
-                                if (context.mounted) Navigator.pop(context);
+                              onTap: () {
+                                setState(() {
+                                  if (isSel) {
+                                    selectedIds.remove(it.id);
+                                  } else {
+                                    selectedIds.add(it.id);
+                                  }
+                                });
+                              },
+                              onLongPress: () {
+                                setState(() {
+                                  if (isSel) {
+                                    selectedIds.remove(it.id);
+                                  } else {
+                                    selectedIds.add(it.id);
+                                  }
+                                });
                               },
                               trailing: IconButton(
-                                icon: const Icon(Icons.drag_handle),
-                                onPressed: () {},
+                                icon: const Icon(Icons.play_arrow),
+                                tooltip: '播放此项',
+                                onPressed: () async {
+                                  await handler.skipToQueueItem(index);
+                                  if (context.mounted) Navigator.pop(context);
+                                },
                               ),
                             );
                           },
