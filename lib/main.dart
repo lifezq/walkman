@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:convert';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -663,6 +664,8 @@ class _HomePageState extends State<HomePage> {
     _applySort(iosList, androidList);
     final List<_FolderSongsGroup> androidFolderGroups =
         !isIOS ? _groupSongsByFolder(androidList) : const <_FolderSongsGroup>[];
+    final List<_FolderSongsGroup> androidRootFolderGroups =
+        !isIOS ? _rootFolderGroups(androidFolderGroups) : const <_FolderSongsGroup>[];
     return Scaffold(
       appBar: AppBar(
         title: const Text('Walkman'),
@@ -826,7 +829,7 @@ class _HomePageState extends State<HomePage> {
             else
               Expanded(
                 child: ListView.separated(
-                  itemCount: isIOS ? iosList.length : androidFolderGroups.length,
+                  itemCount: isIOS ? iosList.length : androidRootFolderGroups.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
                   itemBuilder: (context, index) {
                     if (isIOS) {
@@ -834,6 +837,7 @@ class _HomePageState extends State<HomePage> {
                       final key = item.uri.toString();
                       final liked = player.isLikedKey(key);
                       final favorite = player.isFavoriteKey(key);
+                      final artist = _displayArtist(item.artist);
                       return ListTile(
                         leading: GestureDetector(
                           onTap: () async {
@@ -860,7 +864,7 @@ class _HomePageState extends State<HomePage> {
                         },
                         title: Text(item.title),
                         subtitle: Text([
-                          item.artist ?? '本地文件',
+                          if (artist.isNotEmpty) artist,
                           if (item.duration != null) _fmt(item.duration!)
                         ].join(' · ')),
                         trailing: Row(
@@ -898,7 +902,7 @@ class _HomePageState extends State<HomePage> {
                         ),
                       );
                     } else {
-                      final group = androidFolderGroups[index];
+                      final group = androidRootFolderGroups[index];
                       return ListTile(
                         leading: const Icon(Icons.folder),
                         title: Text(group.name),
@@ -908,8 +912,8 @@ class _HomePageState extends State<HomePage> {
                           Navigator.of(context).push(
                             MaterialPageRoute(
                               builder: (_) => _AndroidFolderSongsPage(
-                                folderPath: group.path,
-                                songs: group.songs,
+                                currentPath: group.path,
+                                allGroups: androidFolderGroups,
                                 onAddSingleSongToPlaylist: _addSingleSongToPlaylist,
                                 onShowSongDetail: _showSongDetail,
                                 onOpenAndroidSong: _openAndroidSong,
@@ -946,6 +950,13 @@ class _HomePageState extends State<HomePage> {
         .toList();
     groups.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     return groups;
+  }
+
+  List<_FolderSongsGroup> _rootFolderGroups(List<_FolderSongsGroup> groups) {
+    final paths = groups.map((e) => e.path).toSet();
+    final roots = groups.where((g) => !paths.contains(_parentFolderPath(g.path))).toList();
+    roots.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return roots;
   }
 
   String _folderPathOfSong(SongModel song) {
@@ -1427,6 +1438,21 @@ String _folderNameFromPath(String path) {
   return segments.last;
 }
 
+String _displayArtist(String? raw) {
+  final v = (raw ?? '').trim();
+  if (v.isEmpty) return '';
+  final lower = v.toLowerCase();
+  if (lower == 'unknown' || lower == '<unknown>' || lower == '未知') return '';
+  return v;
+}
+
+String _parentFolderPath(String path) {
+  final normalized = path.replaceAll('\\', '/');
+  final idx = normalized.lastIndexOf('/');
+  if (idx <= 0) return '';
+  return normalized.substring(0, idx);
+}
+
 class _FolderSongsGroup {
   final String path;
   final String name;
@@ -1440,8 +1466,8 @@ class _FolderSongsGroup {
 }
 
 class _AndroidFolderSongsPage extends StatelessWidget {
-  final String folderPath;
-  final List<SongModel> songs;
+  final String currentPath;
+  final List<_FolderSongsGroup> allGroups;
   final Future<void> Function(BuildContext context, SongModel song) onAddSingleSongToPlaylist;
   final void Function(BuildContext context, SongModel song) onShowSongDetail;
   final Future<void> Function(SongModel song) onOpenAndroidSong;
@@ -1450,8 +1476,8 @@ class _AndroidFolderSongsPage extends StatelessWidget {
   final Future<void> Function(SongModel song) onSaveAndroidSongToLocal;
 
   const _AndroidFolderSongsPage({
-    required this.folderPath,
-    required this.songs,
+    required this.currentPath,
+    required this.allGroups,
     required this.onAddSingleSongToPlaylist,
     required this.onShowSongDetail,
     required this.onOpenAndroidSong,
@@ -1463,37 +1489,55 @@ class _AndroidFolderSongsPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final player = context.watch<PlayerController>();
+    final byPath = {for (final g in allGroups) g.path: g};
+    final songs = byPath[currentPath]?.songs ?? const <SongModel>[];
+    final childGroups = allGroups.where((g) => _parentFolderPath(g.path) == currentPath).toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     return Scaffold(
       appBar: AppBar(
-        title: Text(_folderNameFromPath(folderPath)),
+        title: Text(_folderNameFromPath(currentPath)),
       ),
       body: Column(
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                folderPath,
-                style: Theme.of(context).textTheme.bodySmall,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ),
-          const Divider(height: 1),
           Expanded(
             child: ListView.separated(
-              itemCount: songs.length,
+              itemCount: childGroups.length + songs.length,
               separatorBuilder: (_, __) => const Divider(height: 1),
               itemBuilder: (context, index) {
-                final s = songs[index];
+                if (index < childGroups.length) {
+                  final g = childGroups[index];
+                  return ListTile(
+                    leading: const Icon(Icons.folder),
+                    title: Text(g.name),
+                    subtitle: Text('${g.songs.length} 首歌曲'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => _AndroidFolderSongsPage(
+                            currentPath: g.path,
+                            allGroups: allGroups,
+                            onAddSingleSongToPlaylist: onAddSingleSongToPlaylist,
+                            onShowSongDetail: onShowSongDetail,
+                            onOpenAndroidSong: onOpenAndroidSong,
+                            onLocateInPlaylistByUri: onLocateInPlaylistByUri,
+                            onRemoveFromPlaylistsByUri: onRemoveFromPlaylistsByUri,
+                            onSaveAndroidSongToLocal: onSaveAndroidSongToLocal,
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                }
+                final songIndex = index - childGroups.length;
+                final s = songs[songIndex];
                 final liked = player.isLiked(s.id);
                 final favorite = player.isFavorite(s.id);
+                final artist = _displayArtist(s.artist);
                 return ListTile(
                   leading: GestureDetector(
                     onTap: () async {
-                      await player.setPlaylist(songs, startIndex: index);
+                      await player.setPlaylist(songs, startIndex: songIndex);
                       await player.play();
                       if (!context.mounted) return;
                       FullPlayerPage.open(context);
@@ -1505,12 +1549,12 @@ class _AndroidFolderSongsPage extends StatelessWidget {
                     ),
                   ),
                   onTap: () {
-                    player.setPlaylist(songs, startIndex: index);
+                    player.setPlaylist(songs, startIndex: songIndex);
                     player.play();
                   },
                   title: Text(s.title),
                   subtitle: Text([
-                    s.artist ?? '未知',
+                    if (artist.isNotEmpty) artist,
                     if ((s.duration ?? 0) > 0) _fmt(Duration(milliseconds: s.duration!)),
                   ].join(' · ')),
                   trailing: Row(
@@ -1584,88 +1628,103 @@ class MiniPlayer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final player = context.read<PlayerController>();
+    final mode = context.select<PlayerController, PlayMode>((c) => c.mode);
     return StreamBuilder<MediaItem?>(
       stream: handler.mediaItem,
       builder: (context, snapItem) {
         final item = snapItem.data;
-        return StreamBuilder<PlaybackState>(
-          stream: handler.playbackState,
-          builder: (context, snapState) {
-            final player = context.watch<PlayerController>();
-            final state = snapState.data;
-            final playing = state?.playing ?? false;
-            final position = state?.updatePosition ?? Duration.zero;
-            final duration = item?.duration ?? Duration.zero;
-            final canSeek = duration > Duration.zero;
-            return Material(
-              color: Theme.of(context).colorScheme.surfaceContainerLow,
-              borderRadius: BorderRadius.circular(8),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
+        return Material(
+          color: Theme.of(context).colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
                   children: [
-                    Row(
-                      children: [
-                        IconButton(
-                          tooltip: '播放模式',
-                          onPressed: () => player.cyclePlayMode(),
-                          icon: Icon(_modeIcon(player.mode)),
+                    IconButton(
+                      tooltip: '播放模式',
+                      onPressed: () => player.cyclePlayMode(),
+                      icon: Icon(_modeIcon(mode)),
+                    ),
+                    GestureDetector(
+                      onTap: () {
+                        FullPlayerPage.open(context);
+                      },
+                      child: _ArtworkThumb(item: item),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () {
+                          FullPlayerPage.open(context);
+                        },
+                        child: Text(
+                          item?.title ?? '未播放',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        GestureDetector(
-                          onTap: () {
-                            FullPlayerPage.open(context);
-                          },
-                          child: _ArtworkThumb(item: item),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: GestureDetector(
-                            onTap: () {
-                              FullPlayerPage.open(context);
-                            },
-                            child: Text(
-                              item?.title ?? '未播放',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ),
-                        IconButton(
-                          onPressed: () => handler.skipToPrevious(),
-                          icon: const Icon(Icons.skip_previous),
-                        ),
-                        IconButton(
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: () => handler.skipToPrevious(),
+                      icon: const Icon(Icons.skip_previous),
+                    ),
+                    StreamBuilder<PlaybackState>(
+                      stream: handler.playbackState,
+                      builder: (context, snapState) {
+                        final playing = snapState.data?.playing ?? false;
+                        return IconButton(
                           onPressed: () => playing ? handler.pause() : handler.play(),
                           icon: Icon(playing ? Icons.pause_circle_filled : Icons.play_circle_fill),
-                        ),
-                        IconButton(
-                          onPressed: () => handler.skipToNext(),
-                          icon: const Icon(Icons.skip_next),
-                        ),
-                      ],
+                        );
+                      },
                     ),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        Text(_fmt(position), style: Theme.of(context).textTheme.bodySmall),
-                        Expanded(
-                          child: Slider(
-                            value: position.inMilliseconds.clamp(0, duration.inMilliseconds).toDouble(),
-                            max: (duration.inMilliseconds > 0 ? duration.inMilliseconds : 1).toDouble(),
-                            onChanged: canSeek
-                                ? (v) => handler.seek(Duration(milliseconds: v.round()))
-                                : null,
-                          ),
-                        ),
-                        Text(_fmt(duration), style: Theme.of(context).textTheme.bodySmall),
-                      ],
+                    IconButton(
+                      onPressed: () => handler.skipToNext(),
+                      icon: const Icon(Icons.skip_next),
                     ),
                   ],
                 ),
+                const SizedBox(height: 6),
+                _MiniPositionBar(handler: handler, duration: item?.duration ?? Duration.zero),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _MiniPositionBar extends StatelessWidget {
+  final AudioHandler handler;
+  final Duration duration;
+  const _MiniPositionBar({required this.handler, required this.duration});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<PlaybackState>(
+      stream: handler.playbackState,
+      builder: (context, snapState) {
+        final position = snapState.data?.updatePosition ?? Duration.zero;
+        final canSeek = duration > Duration.zero;
+        return Row(
+          children: [
+            Text(_fmt(position), style: Theme.of(context).textTheme.bodySmall),
+            Expanded(
+              child: Slider(
+                value: position.inMilliseconds.clamp(0, duration.inMilliseconds).toDouble(),
+                max: (duration.inMilliseconds > 0 ? duration.inMilliseconds : 1).toDouble(),
+                onChanged: canSeek
+                    ? (v) => handler.seek(Duration(milliseconds: v.round()))
+                    : null,
               ),
-            );
-          },
+            ),
+            Text(_fmt(duration), style: Theme.of(context).textTheme.bodySmall),
+          ],
         );
       },
     );
@@ -1789,34 +1848,59 @@ String _safeName(String input) {
   return s.length > 64 ? s.substring(s.length - 64) : s;
 }
 
-class NowPlayingListener extends StatelessWidget {
+class NowPlayingListener extends StatefulWidget {
   final Widget child;
   const NowPlayingListener({super.key, required this.child});
+
+  @override
+  State<NowPlayingListener> createState() => _NowPlayingListenerState();
+}
+
+class _NowPlayingListenerState extends State<NowPlayingListener> {
+  AudioHandler? _handler;
+  StreamSubscription<MediaItem?>? _mediaSub;
+  String? _lastHistoryUri;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final current = context.read<AudioHandler>();
+    if (!identical(current, _handler)) {
+      _bindHandler(current);
+    }
+  }
+
+  void _bindHandler(AudioHandler handler) {
+    _mediaSub?.cancel();
+    _handler = handler;
+    _mediaSub = handler.mediaItem.listen((item) {
+      if (item == null) return;
+      if (_lastHistoryUri == item.id) return;
+      _lastHistoryUri = item.id;
+      final artUri = item.artUri;
+      final store = context.read<PlaylistStore>();
+      unawaited(
+        store.addHistory(
+          PlaylistItem(
+            uri: item.id,
+            title: item.title,
+            artist: item.artist,
+            artPath: artUri != null && artUri.scheme == 'file' ? artUri.toFilePath() : null,
+            durationMs: item.duration?.inMilliseconds,
+          ),
+        ),
+      );
+    });
+  }
+
+  @override
+  void dispose() {
+    _mediaSub?.cancel();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final handler = context.watch<AudioHandler>();
-    return StreamBuilder<MediaItem?>(
-      stream: handler.mediaItem,
-      builder: (context, snapshot) {
-        final item = snapshot.data;
-        if (item != null) {
-          // Save to recent history
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            final store = context.read<PlaylistStore>();
-            final artUri = item.artUri;
-            store.addHistory(
-              PlaylistItem(
-                uri: item.id,
-                title: item.title,
-                artist: item.artist,
-                artPath: artUri != null && artUri.scheme == 'file' ? artUri.toFilePath() : null,
-                durationMs: item.duration?.inMilliseconds,
-              ),
-            );
-          });
-        }
-        return child;
-      },
-    );
+    return widget.child;
   }
 }

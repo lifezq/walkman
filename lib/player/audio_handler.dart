@@ -13,11 +13,15 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   ConcatenatingAudioSource? _concat;
   StreamSubscription<PlaybackEvent>? _eventSub;
   StreamSubscription<int?>? _indexSub;
+  StreamSubscription<Duration>? _positionSub;
 
   MyAudioHandler() {
-    _eventSub = _player.playbackEventStream.listen(_broadcastState);
+    _eventSub = _player.playbackEventStream.listen((_) => _broadcastState());
     _indexSub = _player.currentIndexStream.listen((index) {
       _syncMediaItemWithCurrentQueue(index: index);
+    });
+    _positionSub = _player.positionStream.listen((_) {
+      _broadcastState();
     });
   }
 
@@ -185,7 +189,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     }
   }
 
-  void _broadcastState(PlaybackEvent event) {
+  void _broadcastState() {
     final playing = _player.playing;
     final processingState = _player.processingState;
     playbackState.add(
@@ -230,6 +234,7 @@ class MyAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> close() async {
     await _eventSub?.cancel();
     await _indexSub?.cancel();
+    await _positionSub?.cancel();
     await _player.dispose();
   }
 }
